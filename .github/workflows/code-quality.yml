@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 env:
-  DEFAULT_UV: "0.3.0"
+  DEFAULT_UV: "0.5.20"
 
 jobs:
   check-quality:
