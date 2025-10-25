@@ -162,6 +162,10 @@ class Connection:
         """Restart the connection sending/receiving."""
         self._paused = False
 
+    def is_paused(self) -> bool:
+        """Is the connection paused."""
+        return self._paused
+
     def disconnect(self, reason: str = "") -> None:
         """Disconnect and cleanup."""
         LOG.warning("ElkM1 at %s disconnecting %s", self._url, reason)

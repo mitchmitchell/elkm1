@@ -144,6 +144,10 @@ class Elk:
         """Helper to connection is_connected."""
         return self._connection.is_connected()
 
+    def is_paused(self) -> bool:
+        """Helper to connection is_paused."""
+        return self._connection.is_paused()
+
     def send(self, msg: MessageEncode) -> None:
         """Helper to connection send."""
         self._connection.send(msg)
