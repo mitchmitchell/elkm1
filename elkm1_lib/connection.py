@@ -168,7 +168,10 @@ class Connection:
 
     def disconnect(self, reason: str = "") -> None:
         """Disconnect and cleanup."""
-        LOG.warning("ElkM1 at %s disconnecting %s", self._url, reason)
+        if reason:
+            LOG.warning("ElkM1 at %s disconnecting %s", self._url, reason)
+        else:
+            LOG.info("ElkM1 at %s disconnecting", self._url)
         if self._writer:
             self._writer.close()
             self._writer = None
