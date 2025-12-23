@@ -1,275 +1,352 @@
 """
-elkm1.elke27_lib.presentation
+E27 Presentation Layer (E27 schema-0 encryption/decryption, padding, MAGIC handling).
 
-E27 presentation-layer pack/unpack helpers derived 1:1 from the Node-RED prototype.
+This module is intentionally HA-agnostic and contains only protocol/presentation logic.
 
-Inbound (schema-0 encrypted container):
-- Input: frame_no_crc bytes from link layer:
-    [0]=protocol, [1..2]=length (LE), [3..]=dataFrame (ciphertext or clear)
-  (CRC already stripped by deframer; STARTCHAR omitted.)
-- protocol:
-    - encrypted flag: bit7 (0x80)
-    - padding length: low nibble (0x0F)
-- If encrypted:
-    - Select key:
-        - if session_key_hex provided: key = bytes.fromhex(session_key_hex)  (NO swap)
-        - else: key = swap(bytes.fromhex(tempkey_hex))  (tempkey path)
-    - plaintext = swap( AES_CBC_Decrypt(key, IV, swap(ciphertext)) )
-    - parse:
-        seq (u32 LE) at 0
-        src at 4
-        dest at 5
-        head at 6? (Node-RED IN path ignores head and treats JSON at offset 6)
-    - magic is u16 LE located at: len(plaintext) - (paddinglen + 2)
-    - JSON bytes are: plaintext[6 : len - (paddinglen + 2)]
-- If not encrypted:
-    - (Not needed for smoketest; return empty payload for now)
+Key behaviors proven via live panel + Node-RED prototype:
+- AES-128-CBC with fixed IV (API_LINK_IV / initVectorBytes)
+- 32-bit word endianness swap is applied *around* AES operations
+- For schema-0 encrypted payloads, plaintext ends with MAGIC and optional zero padding
+- Some decrypted payloads begin with an ack/head byte before JSON (DDR-0017)
+- The api_link response decrypt path yields: ack byte + JSON (no envelope fields observed)
 
-Outbound (schema-0 encrypted container):
-- Input: json_bytes to send (UTF-8 bytes)
-- Plaintext envelope built as in Node-RED Presentation Layer - OUT:
-    seq u32 LE (default 1234)
-    src u8 (default 1)
-    dest u8 (default 0)
-    head u8 (default 0)
-    json bytes
-    magic u16 LE (0x422A)
-    padding bytes (0x00) to 16-byte boundary
-- paddingBytes computed with:
-    (16 - (length % 16)) & 15
-  where base length is: 4 + 2 + 1 + len(json) + 2
-- protocol byte = 0x80 | paddingBytes
-- ciphertext = swap( AES_CBC_Encrypt(sessionKey, IV, swap(plaintext)) )
-- Return (protocol_byte, ciphertext) to be framed by link-layer.
+Crypto backend: `cryptography` (preferred for production).
 
-Notes:
-- IV is constant API_LINK_IV = bytes(range(16))
-- MAGIC is 0x422A (StaticData.MAGIC)
+Related DDRs:
+- DDR-0017: Ack/Head Byte Before JSON
+- DDR-0019: Provisioning vs Runtime Responsibilities and Module Boundaries
+- DDR-0020: api_link failure is silent (timeout) — handled by caller (linking/session)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Final, Optional, Tuple
 
-from .encryption import (
-    API_LINK_IV,
-    E27CryptoError,
-    calculate_block_padding,
-    decrypt_schema0_ciphertext,
-    encrypt_schema0_plaintext,
-    sessionkey_hex_to_aes_key,
-    tempkey_hex_to_aes_key,
-)
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+from .errors import E27ErrorContext, E27ProtocolError
+from .util import swap_endianness, calculate_block_padding  # swap_endianness is the 32-bit word swap
 
 
-MAGIC: int = 0x422A
+# Fixed IV used by E27 for AES-128-CBC in observed flows
+API_LINK_IV: Final[bytes] = bytes(range(16))  # 00 01 02 ... 0f (Java initVectorBytes)
+
+# Observed MAGIC constant (from Node-RED StaticData.MAGIC)
+E27_MAGIC: Final[int] = 0x422A
+
+# Protocol bits (observed in Node-RED)
+PROTOCOL_ENCRYPTED_FLAG: Final[int] = 0x80
+PROTOCOL_PADDING_MASK: Final[int] = 0x0F  # low nibble carries padding length in schema-0 encrypted
 
 
-class E27PresentationError(ValueError):
-    """Raised when presentation-layer parsing/validation fails."""
+@dataclass(frozen=True, slots=True)
+class E27DecryptedEnvelope:
+    """
+    Decrypted schema-0 envelope.
 
-
-@dataclass(frozen=True)
-class PresentationMeta:
-    protocol: int
-    encrypted: bool
+    Note: You previously concluded envelope 'seq' does not need to be tracked now,
+    but we still parse it for completeness/validation.
+    """
+    envelope_seq: int
+    src: int
+    dest: int
+    head: int
+    payload: bytes  # JSON bytes (or other protocol data), not decoded here
     padding_len: int
-    seq: Optional[int] = None
-    src: Optional[int] = None
-    dest: Optional[int] = None
-    head: Optional[int] = None
-    length_field: Optional[int] = None
+    magic: int
 
 
-def _u16_le(b0: int, b1: int) -> int:
-    return (b0 & 0xFF) | ((b1 & 0xFF) << 8)
+def _require_len(name: str, data: bytes, multiple: int) -> None:
+    if len(data) == 0 or (len(data) % multiple) != 0:
+        raise E27ProtocolError(
+            f"{name} length must be a non-zero multiple of {multiple}, got {len(data)}.",
+            context=E27ErrorContext(phase="presentation_validate", detail=f"{name}_len={len(data)}"),
+        )
 
 
-def unpack_inbound(
+def _require_key_16(key: bytes, *, context_phase: str) -> None:
+    if len(key) != 16:
+        raise E27ProtocolError(
+            f"AES-128 key must be 16 bytes, got {len(key)}.",
+            context=E27ErrorContext(phase=context_phase, detail=f"key_len={len(key)}"),
+        )
+
+
+def _aes128_cbc_decrypt(*, key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    _require_key_16(key, context_phase="presentation_decrypt")
+    _require_len("ciphertext", ciphertext, 16)
+    if len(iv) != 16:
+        raise E27ProtocolError(
+            f"IV must be 16 bytes, got {len(iv)}.",
+            context=E27ErrorContext(phase="presentation_decrypt", detail=f"iv_len={len(iv)}"),
+        )
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    return decryptor.update(ciphertext) + decryptor.finalize()
+
+
+def _aes128_cbc_encrypt(*, key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    _require_key_16(key, context_phase="presentation_encrypt")
+    _require_len("plaintext", plaintext, 16)
+    if len(iv) != 16:
+        raise E27ProtocolError(
+            f"IV must be 16 bytes, got {len(iv)}.",
+            context=E27ErrorContext(phase="presentation_encrypt", detail=f"iv_len={len(iv)}"),
+        )
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    return encryptor.update(plaintext) + encryptor.finalize()
+
+
+def protocol_padding_len(protocol_byte: int) -> int:
+    """Extract padding length from protocol byte (low nibble)."""
+    return int(protocol_byte & PROTOCOL_PADDING_MASK)
+
+
+def protocol_is_encrypted(protocol_byte: int) -> bool:
+    return (protocol_byte & PROTOCOL_ENCRYPTED_FLAG) == PROTOCOL_ENCRYPTED_FLAG
+
+
+def decrypt_schema0_envelope(
     *,
-    frame_no_crc: bytes,
-    tempkey_hex: Optional[str],
-    session_key_hex: Optional[str],
-) -> Tuple[PresentationMeta, bytes]:
+    protocol_byte: int,
+    ciphertext: bytes,
+    session_key: bytes,
+    iv: bytes = API_LINK_IV,
+    require_magic: bool = True,
+) -> E27DecryptedEnvelope:
     """
-    Unpack an inbound link-layer frame (CRC stripped) into JSON bytes.
+    Decrypt a schema-0 encrypted message and parse the envelope:
+      seq(4 LE) + src(1) + dest(1) + head(1) + payload + MAGIC(2 LE) + padding(0..15)
 
-    Args:
-        frame_no_crc: bytes including protocol + length(LE) + dataFrame (ciphertext or clear)
-        tempkey_hex: used when session_key_hex is None (api_link response decrypt)
-        session_key_hex: used for normal schema-0 decrypt
+    The AES decrypt is wrapped with swap_endianness() on 32-bit word boundaries, matching
+    the working Node-RED prototype and live tests:
+      plaintext = swap( AES_DEC( swap(ciphertext) ) ); then swap(plaintext)
 
-    Returns:
-        (meta, json_bytes)
+    `padding_len` is derived from protocol byte low nibble.
 
-    Raises:
-        E27PresentationError on parse errors, invalid lengths, magic mismatch, etc.
+    Raises E27ProtocolError on invalid lengths, MAGIC mismatch, or structural errors.
     """
-    if frame_no_crc is None:
-        raise E27PresentationError("unpack_inbound: frame_no_crc is None")
-    if len(frame_no_crc) < 3:
-        raise E27PresentationError(f"unpack_inbound: frame too short ({len(frame_no_crc)} bytes)")
+    if not protocol_is_encrypted(protocol_byte):
+        raise E27ProtocolError(
+            "decrypt_schema0_envelope called for non-encrypted protocol byte.",
+            context=E27ErrorContext(phase="presentation_decrypt", detail=f"protocol=0x{protocol_byte:02x}"),
+        )
 
-    protocol = frame_no_crc[0] & 0xFF
-    length_field = _u16_le(frame_no_crc[1], frame_no_crc[2])
-    encrypted = (protocol & 0x80) == 0x80
-    padding_len = protocol & 0x0F
+    pad_len = protocol_padding_len(protocol_byte)
 
-    meta = PresentationMeta(
-        protocol=protocol,
-        encrypted=encrypted,
-        padding_len=padding_len,
-        length_field=length_field,
-    )
+    # Ciphertext is 32-bit word swapped before AES, per prototype
+    ct_swapped = swap_endianness(ciphertext)
+    pt = _aes128_cbc_decrypt(key=session_key, iv=iv, ciphertext=ct_swapped)
+    pt = swap_endianness(pt)
 
-    # Link-layer length includes CRC, but CRC has been stripped already in frame_no_crc.
-    # Node-RED "IN" uses:
-    #   msglength = readInt16LE(1) - 2   # account for stripped CRC
-    #   dataFrameLen = msglength - 3     # strip protocol+length
-    # That implies ciphertext bytes count should be: (length_field - 2) - 3 = length_field - 5
-    # However, on TCP we should trust the actual bytes received rather than recompute.
-    if len(frame_no_crc) < 3:
-        return meta, b""
+    if len(pt) < (4 + 1 + 1 + 1 + 2):
+        raise E27ProtocolError(
+            f"Decrypted plaintext too short for envelope: {len(pt)} bytes.",
+            context=E27ErrorContext(phase="presentation_decrypt", detail=f"pt_len={len(pt)}"),
+        )
 
-    data_frame = frame_no_crc[3:]
+    # Parse fixed envelope header
+    envelope_seq = int.from_bytes(pt[0:4], "little", signed=False)
+    src = pt[4]
+    dest = pt[5]
+    head = pt[6]
 
-    if not encrypted:
-        # For now, return the raw data_frame; callers may parse JSON directly.
-        # (Hello response appears clear JSON at the TCP layer, not schema-0 encrypted.)
-        return meta, bytes(data_frame)
+    # MAGIC sits just before padding bytes at end: [... payload ...][MAGIC(2)][PAD...]
+    if pad_len < 0 or pad_len > 15:
+        raise E27ProtocolError(
+            f"Invalid padding length in protocol byte: {pad_len}.",
+            context=E27ErrorContext(phase="presentation_decrypt", detail=f"pad_len={pad_len}"),
+        )
 
-    # Encrypted schema-0 decrypt
-    if session_key_hex:
-        key = sessionkey_hex_to_aes_key(session_key_hex)
-    else:
-        if not tempkey_hex:
-            raise E27PresentationError("unpack_inbound: tempkey_hex required when session_key_hex is not provided")
-        key = tempkey_hex_to_aes_key(tempkey_hex)
+    magic_off = len(pt) - (pad_len + 2)
+    if magic_off < 7:
+        raise E27ProtocolError(
+            "Decrypted plaintext too short for MAGIC/padding layout.",
+            context=E27ErrorContext(phase="presentation_decrypt", detail=f"magic_off={magic_off}"),
+        )
 
-    try:
-        plaintext = decrypt_schema0_ciphertext(key=key, ciphertext=bytes(data_frame), iv=API_LINK_IV)
-    except E27CryptoError as e:
-        raise E27PresentationError(f"unpack_inbound: decrypt failed: {e}") from e
+    magic = int.from_bytes(pt[magic_off : magic_off + 2], "little", signed=False)
+    if require_magic and magic != E27_MAGIC:
+        raise E27ProtocolError(
+            f"MAGIC mismatch after decrypt (got 0x{magic:04x}, expected 0x{E27_MAGIC:04x}).",
+            context=E27ErrorContext(phase="presentation_decrypt", detail=f"magic=0x{magic:04x}"),
+        )
 
-    if len(plaintext) < 8:
-        raise E27PresentationError(f"unpack_inbound: decrypted plaintext too short ({len(plaintext)} bytes)")
+    payload = pt[7:magic_off]  # payload bytes between head and MAGIC
 
-    # Extract envelope fields
-    seq = int.from_bytes(plaintext[0:4], "little", signed=False)
-    src = plaintext[4] & 0xFF
-    dest = plaintext[5] & 0xFF
-    head = plaintext[6] & 0xFF  # present in outbound builder; inbound Node-RED ignores but we record it
-
-    # MAGIC check at end - (padding + 2)
-    if padding_len < 0 or padding_len > 15:
-        raise E27PresentationError(f"unpack_inbound: invalid padding_len {padding_len}")
-
-    magic_off = len(plaintext) - (padding_len + 2)
-    if magic_off < 0 or magic_off + 2 > len(plaintext):
-        raise E27PresentationError("unpack_inbound: invalid magic offset derived from padding")
-
-    magic = int.from_bytes(plaintext[magic_off : magic_off + 2], "little", signed=False)
-    if magic != MAGIC:
-        raise E27PresentationError(f"unpack_inbound: MAGIC mismatch (got 0x{magic:04X}, expected 0x{MAGIC:04X})")
-
-    json_start = 6  # Node-RED IN slices from 6, not 7; it does NOT include 'head' in message bytes
-    json_end = magic_off
-    if json_end < json_start:
-        raise E27PresentationError("unpack_inbound: invalid JSON slice (end before start)")
-
-    json_bytes = plaintext[json_start:json_end]
-
-    meta = PresentationMeta(
-        protocol=protocol,
-        encrypted=encrypted,
-        padding_len=padding_len,
-        seq=seq,
+    return E27DecryptedEnvelope(
+        envelope_seq=envelope_seq,
         src=src,
         dest=dest,
         head=head,
-        length_field=length_field,
+        payload=payload,
+        padding_len=pad_len,
+        magic=magic,
     )
 
-    return meta, bytes(json_bytes)
 
-
-def pack_outbound_schema0(
+def encrypt_schema0_envelope(
     *,
-    json_bytes: bytes,
-    session_key_hex: str,
+    payload: bytes,
+    session_key: bytes,
     src: int = 1,
     dest: int = 0,
-    seq: int = 1234,
     head: int = 0,
+    envelope_seq: int = 0,
+    iv: bytes = API_LINK_IV,
 ) -> Tuple[int, bytes]:
     """
-    Build a schema-0 encrypted presentation-layer dataFrame and protocol byte, matching Node-RED.
+    Build and encrypt a schema-0 envelope.
 
-    Returns:
-        (protocol_byte, ciphertext_data_frame)
+    Layout before AES:
+      seq(4 LE) + src(1) + dest(1) + head(1) + payload + MAGIC(2 LE) + padding(0..15 of 0x00)
 
-    Caller must feed these into link-layer framing.frame_build(protocol_byte, data_frame).
+    Padding is computed to make total length a multiple of 16, and padding length
+    is encoded into protocol byte low nibble, with encrypted flag set.
 
-    Raises:
-        E27PresentationError on invalid inputs.
+    Returns (protocol_byte, ciphertext_bytes)
     """
-    if json_bytes is None:
-        raise E27PresentationError("pack_outbound_schema0: json_bytes is None")
-    if not isinstance(json_bytes, (bytes, bytearray)):
-        raise E27PresentationError(f"pack_outbound_schema0: json_bytes must be bytes-like, got {type(json_bytes).__name__}")
-    if not session_key_hex:
-        raise E27PresentationError("pack_outbound_schema0: session_key_hex is required")
-    if not (0 <= src <= 0xFF and 0 <= dest <= 0xFF and 0 <= head <= 0xFF):
-        raise E27PresentationError("pack_outbound_schema0: src/dest/head must be 0..255")
-    if not (0 <= seq <= 0xFFFFFFFF):
-        raise E27PresentationError("pack_outbound_schema0: seq must fit uint32")
-
-    payload = bytes(json_bytes)
-
-    # Base length: seq(4) + src/dest(2) + head(1) + payload + magic(2)
-    base_len = 4 + 2 + 1 + len(payload) + 2
-    padding = calculate_block_padding(base_len)
-    total_len = base_len + padding
-
-    protocol_byte = 0x80 | (padding & 0x0F)
-
-    # Build plaintext envelope
-    buf = bytearray(total_len)
-    idx = 0
-
-    buf[idx : idx + 4] = int(seq).to_bytes(4, "little", signed=False)
-    idx += 4
-
-    buf[idx] = src & 0xFF
-    idx += 1
-    buf[idx] = dest & 0xFF
-    idx += 1
-    buf[idx] = head & 0xFF
-    idx += 1
-
-    buf[idx : idx + len(payload)] = payload
-    idx += len(payload)
-
-    # MAGIC then padding (Node-RED writes MAGIC first, then fills padding after it)
-    buf[idx : idx + 2] = int(MAGIC).to_bytes(2, "little", signed=False)
-    idx += 2
-
-    if padding:
-        # Padding bytes are 0x00
-        buf[idx : idx + padding] = b"\x00" * padding
-        idx += padding
-
-    if idx != total_len:
-        raise E27PresentationError(
-            f"pack_outbound_schema0: internal length mismatch (wrote {idx}, expected {total_len})"
+    if not isinstance(payload, (bytes, bytearray)):
+        raise E27ProtocolError(
+            "payload must be bytes.",
+            context=E27ErrorContext(phase="presentation_encrypt"),
+        )
+    if not (0 <= src <= 255 and 0 <= dest <= 255 and 0 <= head <= 255):
+        raise E27ProtocolError(
+            "src/dest/head must be 0..255.",
+            context=E27ErrorContext(phase="presentation_encrypt", detail=f"src={src},dest={dest},head={head}"),
+        )
+    if envelope_seq < 0 or envelope_seq > 0xFFFFFFFF:
+        raise E27ProtocolError(
+            "envelope_seq must be a 32-bit unsigned integer.",
+            context=E27ErrorContext(phase="presentation_encrypt", detail=f"seq={envelope_seq}"),
         )
 
-    # Encrypt schema-0 with session key (NO key swap)
-    key = sessionkey_hex_to_aes_key(session_key_hex)
-    try:
-        ciphertext = encrypt_schema0_plaintext(key=key, plaintext=bytes(buf), iv=API_LINK_IV)
-    except E27CryptoError as e:
-        raise E27PresentationError(f"pack_outbound_schema0: encrypt failed: {e}") from e
+    base_len = 4 + 1 + 1 + 1 + len(payload) + 2
+    pad_len = calculate_block_padding(base_len)
+    if pad_len < 0 or pad_len > 15:
+        raise E27ProtocolError(
+            f"Calculated invalid padding length: {pad_len}.",
+            context=E27ErrorContext(phase="presentation_encrypt", detail=f"base_len={base_len}"),
+        )
 
-    return protocol_byte, ciphertext
+    total_len = base_len + pad_len
+    if total_len % 16 != 0:
+        raise E27ProtocolError(
+            "Envelope length is not a multiple of 16 after padding (internal error).",
+            context=E27ErrorContext(phase="presentation_encrypt", detail=f"total_len={total_len}"),
+        )
+
+    buf = bytearray(total_len)
+    buf[0:4] = int(envelope_seq).to_bytes(4, "little", signed=False)
+    buf[4] = src & 0xFF
+    buf[5] = dest & 0xFF
+    buf[6] = head & 0xFF
+
+    # payload
+    p_off = 7
+    buf[p_off : p_off + len(payload)] = payload
+
+    # MAGIC
+    m_off = p_off + len(payload)
+    buf[m_off : m_off + 2] = int(E27_MAGIC).to_bytes(2, "little", signed=False)
+
+    # padding zeros already present by default in bytearray()
+
+    protocol = PROTOCOL_ENCRYPTED_FLAG | (pad_len & PROTOCOL_PADDING_MASK)
+
+    # Apply 32-bit swap around AES, matching working prototype
+    pt_swapped = swap_endianness(bytes(buf))
+    ct = _aes128_cbc_encrypt(key=session_key, iv=iv, plaintext=pt_swapped)
+    ct = swap_endianness(ct)
+
+    return protocol, ct
+
+
+def decrypt_api_link_response(
+    *,
+    ciphertext: bytes,
+    tempkey_hex: str,
+    iv: bytes = API_LINK_IV,
+) -> Tuple[int, bytes]:
+    """
+    Decrypt the api_link response payload.
+
+    Observed plaintext format (from your live log):
+      [ack_byte][JSON bytes...]
+
+    Unlike general schema-0 envelopes, the api_link response was handled in Node-RED
+    by stripping a leading ack byte and parsing the remaining bytes as JSON without
+    MAGIC/padding parsing.
+
+    Returns: (ack_byte, json_bytes)
+
+    NOTE: This does NOT validate MAGIC or parse envelope fields.
+    """
+    try:
+        key = bytes.fromhex(tempkey_hex)
+    except ValueError as e:
+        raise E27ProtocolError(
+            "tempkey_hex is not valid hex.",
+            context=E27ErrorContext(phase="api_link_decrypt"),
+            cause=e,
+        )
+    _require_key_16(key, context_phase="api_link_decrypt")
+
+    ct_swapped = swap_endianness(ciphertext)
+    pt = _aes128_cbc_decrypt(key=key, iv=iv, ciphertext=ct_swapped)
+    pt = swap_endianness(pt)
+
+    if len(pt) < 2:
+        raise E27ProtocolError(
+            "api_link decrypt returned too few bytes.",
+            context=E27ErrorContext(phase="api_link_decrypt", detail=f"pt_len={len(pt)}"),
+        )
+
+    ack = pt[0]
+    json_bytes = pt[1:]
+    return ack, json_bytes
+
+
+def decrypt_key_field_with_linkkey(
+    *,
+    linkkey_hex: str,
+    ciphertext_hex: str,
+    iv: bytes = API_LINK_IV,
+    swap_key_32bit: bool = True,
+) -> bytes:
+    """
+    Helper for hello response fields sk/shm.
+
+    Node-RED proven flow:
+      key_bytes = swap_endianness(hex_to_bytes(linkkey))
+      plaintext = swap_endianness( AES_DEC( swap_endianness(ciphertext) ) )
+
+    Returns raw decrypted bytes (caller can hex-encode if desired).
+
+    This is provided here so hello.py can stay thin and consistent.
+    """
+    try:
+        key = bytes.fromhex(linkkey_hex)
+        ct = bytes.fromhex(ciphertext_hex)
+    except ValueError as e:
+        raise E27ProtocolError(
+            "Invalid hex input to decrypt_key_field_with_linkkey.",
+            context=E27ErrorContext(phase="hello_key_decrypt"),
+            cause=e,
+        )
+    _require_key_16(key, context_phase="hello_key_decrypt")
+    _require_len("hello_key_ciphertext", ct, 16)
+
+    if swap_key_32bit:
+        key = swap_endianness(key)
+
+    ct_swapped = swap_endianness(ct)
+    pt = _aes128_cbc_decrypt(key=key, iv=iv, ciphertext=ct_swapped)
+    pt = swap_endianness(pt)
+    return pt

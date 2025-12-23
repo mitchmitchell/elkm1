@@ -1,460 +1,203 @@
-#!/usr/bin/env python3
-"""
-E27 live smoketest (minimal harness)
-
-Proves end-to-end against a real panel:
-  - Receive discovery hello (clear JSON) and extract panel nonce
-  - Send api_link (clear JSON, UNFRAMED)
-  - Receive api_link response (FRAMED + schema-0 encrypted), decrypt with tempkey, extract linkkey/linkhmac
-  - Send hello (clear JSON, UNFRAMED)
-  - Receive hello response (clear JSON with encrypted sk/shm), decrypt sk/shm with linkkey to get sessionKey/hmacKey
-  - Send one encrypted command (authenticate), receive/decrypt response and print JSON
-  - Optionally send area.get_status after authenticate
-
-Notes:
-  - Cleartext JSON messages are NOT framed:
-      discovery hello, api_link request, hello request, hello response
-  - Encrypted schema-0 messages ARE framed:
-      api_link response, authenticate, all subsequent encrypted commands/responses
-  - Application layer prepends one byte (ack/head) before the JSON inside the decrypted payload.
-    Node-RED strips this in Application Layer; we do the same here.
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
-import socket
 import os
+import socket
 import sys
 import time
-from typing import Any, Optional
+from typing import Optional
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from elkm1.elke27_lib.framing import DeframeState, deframe_feed, frame_build
-from elkm1.elke27_lib.linking import (
-    parse_concatenated_json_objects,
-    prepare_api_link,
-    build_hello_request_json,
+from elkm1.elke27_lib.errors import (
+    E27Error,
+    E27ErrorContext,
+    E27ProvisioningRequired,
+    E27ProvisioningTimeout,
+    E27ProtocolError,
+    E27TransportError,
 )
-from elkm1.elke27_lib.presentation import unpack_inbound, pack_outbound_schema0
-from elkm1.elke27_lib.encryption import decrypt_hello_field
+from elkm1.elke27_lib.linking import (
+    API_LINK_IV,
+    E27Identity,
+    LinkCredentials,
+    build_api_link_request,
+    derive_pass_tempkey_with_cnonce,
+    parse_api_link_response_json,
+    recv_cleartext_json_objects,
+    send_unframed_json,
+)
+from elkm1.elke27_lib.hello import perform_hello
+
+# NOTE: Replace these imports with your real modules/functions
+# from elkm1.elke27_lib.framing import E27Deframer
+# from elkm1.elke27_lib.presentation import decrypt_schema0_payload, decrypt_api_link_response
 
 
-DEFAULT_PORT = 2101
+def _env_required(name: str) -> str:
+    v = (os.environ.get(name) or "").strip()
+    if not v:
+        raise SystemExit(f"Missing required environment variable: {name}")
+    return v
 
 
-def _hex(b: bytes) -> str:
-    return b.hex().upper()
+def _connect(host: str, port: int, timeout_s: float = 5.0) -> socket.socket:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout_s)
+    s.connect((host, port))
+    return s
 
 
-def _pretty_json(obj: Any) -> str:
-    return json.dumps(obj, indent=2, sort_keys=True)
+def _recv_some(sock: socket.socket, timeout_s: float = 5.0) -> bytes:
+    sock.settimeout(timeout_s)
+    return sock.recv(4096)
 
 
-def _bytes_to_hex_upper(b: bytes) -> str:
-    return b.hex().upper()
-
-
-def recv_some(sock: socket.socket, size: int) -> bytes:
-    try:
-        return sock.recv(size)
-    except socket.timeout:
-        return b""
-
-
-def strip_ack_and_parse_json(app_bytes: bytes, *, label: str, log_raw: bool) -> tuple[int, Any]:
-    """
-    app_bytes = ack/head (1 byte) + JSON bytes
-
-    Returns:
-      (acknack, obj)
-
-    Raises:
-      ValueError on parse failure
-    """
-    if not app_bytes:
-        raise ValueError(f"{label}: empty app_bytes")
-
-    acknack = app_bytes[0] & 0xFF
-    json_only = app_bytes[1:]
-
-    if log_raw:
-        print(f"<< ack/nack byte: 0x{acknack:X}".lower())
-
-    try:
-        obj = json.loads(json_only.decode("utf-8"))
-    except Exception as e:
-        raise ValueError(f"{label}: JSON decode failed: {e}") from e
-
-    return acknack, obj
-
-
-def wait_for_discovery(sock: socket.socket, *, recv_chunk: int, timeout: float, log_raw: bool) -> dict[str, Any]:
-    print("Waiting for discovery hello (ELKWC2017)...")
-    t0 = time.time()
+def _parse_discovery_nonce(sock: socket.socket, timeout_s: float = 10.0) -> str:
+    deadline = time.monotonic() + timeout_s
     buf = bytearray()
-
-    while (time.time() - t0) < timeout:
-        chunk = recv_some(sock, recv_chunk)
-        if not chunk:
-            continue
-
-        buf.extend(chunk)
-        if log_raw:
-            print(f"<< raw recv {len(chunk)} bytes: {_hex(chunk)}")
-
-        # Discovery often arrives as concatenated JSON objects (e.g., ELKWC2017 + LOCAL).
-        # Parse what we have each time and look for the one with ELKWC2017.
+    sock.settimeout(1.0)
+    while time.monotonic() < deadline:
         try:
-            parts = parse_concatenated_json_objects(buf.decode("utf-8", errors="ignore"))
-        except Exception:
+            chunk = sock.recv(4096)
+        except socket.timeout:
             continue
-
-        for p in parts:
-            try:
-                obj = json.loads(p)
-            except Exception:
-                continue
-            if "ELKWC2017" in obj:
-                return obj
-
-    raise TimeoutError("Timed out waiting for discovery hello (ELKWC2017).")
-
-
-def wait_for_api_link_response(
-    sock: socket.socket,
-    *,
-    deframe_state: DeframeState,
-    tempkey_hex: str,
-    recv_chunk: int,
-    timeout: float,
-    log_raw: bool,
-) -> tuple[int, dict[str, Any]]:
-    print("Waiting for api_link response (encrypted, schema-0)...")
-    t0 = time.time()
-
-    while (time.time() - t0) < timeout:
-        chunk = recv_some(sock, recv_chunk)
         if not chunk:
-            continue
-
-        if log_raw:
-            print(f"<< raw recv {len(chunk)} bytes: {_hex(chunk)}")
-
-        results = deframe_feed(deframe_state, chunk)
-        for r in results:
-            if not r.ok:
-                print(f"!! deframe error: {r.error}")
-                continue
-
-            frame_no_crc = r.frame_no_crc or b""
-            if log_raw:
-                print(f"<< frame_no_crc: {_hex(frame_no_crc)}")
-
-            meta, app_bytes = unpack_inbound(
-                frame_no_crc=frame_no_crc,
-                tempkey_hex=tempkey_hex,
-                session_key_hex=None,
-            )
-
-            if log_raw:
-                print(f"<< decrypted JSON bytes: {_hex(app_bytes)}")
-
-            try:
-                _, obj = strip_ack_and_parse_json(app_bytes, label="api_link", log_raw=log_raw)
-            except Exception as e:
-                print(f"!! {e}")
-                continue
-
-            return (app_bytes[0] & 0xFF), obj
-
-    raise TimeoutError("Timed out waiting for decrypted api_link response / link key.")
-
-
-def wait_for_hello_response(
-    sock: socket.socket,
-    *,
-    recv_chunk: int,
-    timeout: float,
-    log_raw: bool,
-) -> dict[str, Any]:
-    print("Waiting for hello response (clear JSON with encrypted sk/shm)...")
-    t0 = time.time()
-    buf = bytearray()
-
-    while (time.time() - t0) < timeout:
-        chunk = recv_some(sock, recv_chunk)
-        if not chunk:
-            continue
-
+            raise E27TransportError("Socket closed during discovery.", context=E27ErrorContext(phase="discovery"))
         buf.extend(chunk)
-        if log_raw:
-            print(f"<< raw recv {len(chunk)} bytes: {_hex(chunk)}")
-
-        # Hello response is clear JSON, and can also arrive concatenated.
+        s = buf.decode("utf-8", errors="ignore")
+        if "ELKWC2017" not in s:
+            continue
+        # reuse cleartext parser from linking module
+        objs = []
         try:
-            parts = parse_concatenated_json_objects(buf.decode("utf-8", errors="ignore"))
+            objs = json.loads(buf.decode("utf-8", errors="replace").strip().split("}{")[0] + "}")  # fallback
         except Exception:
-            continue
-
-        for p in parts:
-            try:
-                obj = json.loads(p)
-            except Exception:
-                continue
-            if "hello" in obj:
-                return obj
-
-    raise TimeoutError("Timed out waiting for hello response.")
-
-
-def wait_for_encrypted_response(
-    sock: socket.socket,
-    *,
-    deframe_state: DeframeState,
-    session_key_hex: str,
-    recv_chunk: int,
-    timeout: float,
-    log_raw: bool,
-    label: str,
-) -> tuple[int, dict[str, Any]]:
-    print("Waiting for encrypted response...")
-    t0 = time.time()
-
-    while (time.time() - t0) < timeout:
-        chunk = recv_some(sock, recv_chunk)
-        if not chunk:
-            continue
-
-        if log_raw:
-            print(f"<< raw recv {len(chunk)} bytes: {_hex(chunk)}")
-
-        results = deframe_feed(deframe_state, chunk)
-        for r in results:
-            if not r.ok:
-                print(f"!! deframe error: {r.error}")
-                continue
-
-            frame_no_crc = r.frame_no_crc or b""
-            meta, app_bytes = unpack_inbound(
-                frame_no_crc=frame_no_crc,
-                tempkey_hex=None,
-                session_key_hex=session_key_hex,
-            )
-
-            try:
-                ack, obj = strip_ack_and_parse_json(app_bytes, label=label, log_raw=log_raw)
-            except Exception as e:
-                print(f"!! {e}")
-                if log_raw:
-                    print(f"!! decrypted bytes: {_hex(app_bytes)}")
-                continue
-
-            return ack, obj
-
-    raise TimeoutError(f"Timed out waiting for encrypted response: {label}")
+            pass
+        # Prefer robust parser:
+        from elkm1.elke27_lib.linking import recv_cleartext_json_objects_from_bytes
+        for obj in recv_cleartext_json_objects_from_bytes(bytes(buf)):
+            if "nonce" in obj:
+                return str(obj["nonce"])
+    raise E27ProvisioningTimeout(
+        "Timed out waiting for discovery nonce.",
+        context=E27ErrorContext(phase="discovery"),
+    )
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", required=True, help="Panel IP/hostname")
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="Panel port (default 2101)")
-    ap.add_argument("--timeout", type=float, default=10.0, help="Timeout seconds per wait phase")
-    ap.add_argument("--recv-chunk", type=int, default=4096, help="Socket recv() size")
-    ap.add_argument("--log-raw", action="store_true", help="Print raw hex of inbound/outbound")
-    ap.add_argument("--pin", type=int, default=4231, help="PIN for authenticate")
-    ap.add_argument("--do-area-status", action="store_true", help="After authenticate, send area.get_status area_id=1")
+    ap.add_argument("--host", required=True)
+    ap.add_argument("--port", type=int, default=2101)
+    ap.add_argument("--do-area-status", action="store_true")
+    ap.add_argument("--pin", type=int, default=4231)
+    ap.add_argument("--log-raw", action="store_true")
     args = ap.parse_args()
 
-    access_code = (os.environ.get("E27_ACCESS_CODE") or "12345678").strip()
-    passphrase = (os.environ.get("E27_PASSPHRASE") or "my pass phrase").strip()
-    mn = (os.environ.get("E27_MN") or "100").strip()
+    access_code = _env_required("E27_ACCESS_CODE")
+    passphrase = _env_required("E27_PASSPHRASE")
+    mn = _env_required("E27_MN")
 
-    if not access_code or not passphrase or not mn:
-        print("ERROR: E27_ACCESS_CODE, E27_PASSPHRASE, E27_MN must be set in environment.", file=sys.stderr)
-        return 2
+    # Identity fields: keep same defaults you used in smoketest
+    sn = "A4FC143918A4"  # you later decided to derive from MAC; keep as-is here
+    identity = E27Identity(mn=mn, sn=sn, fwver="0.0.1", hwver="0.0.1", osver="0.0.1")
 
     print(f"Connecting to {args.host}:{args.port} ...")
-    with socket.create_connection((args.host, args.port), timeout=args.timeout) as sock:
-        sock.settimeout(0.25)
-        print("Connected.")
+    sock = _connect(args.host, args.port, timeout_s=5.0)
+    print("Connected.")
 
-        # 1) discovery hello
-        disc = wait_for_discovery(sock, recv_chunk=args.recv_chunk, timeout=args.timeout, log_raw=args.log_raw)
-        nonce = str(disc.get("nonce", "")).strip().lower()
-        if not nonce:
-            print(f"ERROR: discovery did not include nonce: {disc}", file=sys.stderr)
-            return 1
+    # 1) discovery (clear)
+    print("Waiting for discovery hello (ELKWC2017)...")
+    nonce = _parse_discovery_nonce(sock, timeout_s=10.0)
+    if args.log_raw:
         print(f"Discovery nonce: {nonce}")
+    else:
+        print("Discovery nonce received.")
 
-        # 2) api_link clear (UNFRAMED)
-        linkprep = prepare_api_link(
-            panel_host=args.host,
-            access_code=access_code,
-            passphrase=passphrase,
-            mn=mn,
-            panel_nonce_hex=nonce,
+    # 2) api_link request (clear/unframed) + response (framed/encrypted)
+    #    NOTE: per DDR-0020, wrong creds == silent timeout; treat as provisioning timeout.
+    # Derivation must match what you proved in Node-RED:
+    cnonce = os.urandom(20).hex().lower()
+    pass8, tempkey_hex = derive_pass_tempkey_with_cnonce(
+        access_code=access_code,
+        passphrase=passphrase,
+        nonce=nonce,
+        cnonce=cnonce,
+        mn=mn,
+        sn=identity.sn,
+    )
+    api_link_json = build_api_link_request(seq=110, identity=identity, pass_hex8=pass8, cnonce_hex=cnonce)
+
+    print("Sending api_link (clear, UNFRAMED)...")
+    if args.log_raw:
+        print(f">> api_link JSON: {api_link_json}")
+    send_unframed_json(sock, api_link_json)
+
+    print("Waiting for api_link response (encrypted, schema-0)...")
+    # --- RECEIVE + DECRYPT api_link response ---
+    # Replace this block with your working deframer + schema0 decrypt.
+    # Expected output: decrypted bytes that start with ack byte then JSON bytes.
+    try:
+        raw = _recv_some(sock, timeout_s=5.0)
+    except socket.timeout as e:
+        raise E27ProvisioningTimeout(
+            "No response to api_link (panel may silently ignore incorrect credentials).",
+            context=E27ErrorContext(host=args.host, port=args.port, phase="api_link"),
+            cause=e,
         )
 
-        print("Sending api_link (clear, UNFRAMED)...")
-        if args.log_raw:
-            print(f">> api_link JSON: {linkprep.request_json_bytes.decode('utf-8', errors='replace')}")
-        sock.sendall(linkprep.request_json_bytes)
+    if args.log_raw:
+        print(f"<< raw recv {len(raw)} bytes: {raw.hex().upper()}")
 
-        # 3) api_link response framed + schema-0 encrypted (decrypt with tempkey)
-        deframe_state = DeframeState()
-        _, api_link_obj = wait_for_api_link_response(
-            sock,
-            deframe_state=deframe_state,
-            tempkey_hex=linkprep.tempkey_hex,
-            recv_chunk=args.recv_chunk,
-            timeout=args.timeout,
-            log_raw=args.log_raw,
+    # TODO: plug in your real stream deframer here
+    # frame_no_crc = deframer.consume(raw) -> bytes (protocol+len+payload without crc)
+    # decrypted = presentation.decrypt_schema0(frame_no_crc, key=tempkey_hex, iv=API_LINK_IV) -> bytes
+    # For now, require you to wire these two functions to match your current codebase.
+    from elkm1.elke27_lib.tools.e27_smoketest import _deframe_one_frame_from_bytes, _decrypt_schema0_frame  # type: ignore
+
+    frame_no_crc = _deframe_one_frame_from_bytes(raw)
+    decrypted = _decrypt_schema0_frame(frame_no_crc, key_hex=tempkey_hex)
+
+    if args.log_raw:
+        print(f"<< decrypted JSON bytes: {decrypted.hex().upper()}")
+
+    if not decrypted:
+        raise E27ProtocolError("api_link decrypt returned empty plaintext.", context=E27ErrorContext(phase="api_link_decrypt"))
+
+    ack = decrypted[0]
+    json_bytes = decrypted[1:]
+    if args.log_raw:
+        print(f"<< ack/nack byte: 0x{ack:02x}")
+
+    try:
+        obj = json.loads(json_bytes.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        raise E27ProtocolError(
+            f"JSON decode failed after api_link decrypt: {e}",
+            context=E27ErrorContext(phase="api_link_json_decode"),
+            cause=e,
         )
 
-        print("api_link response decrypted OK.")
-        try:
-            api_link = api_link_obj["api_link"]
-            linkkey_hex = str(api_link["enc"]).strip()
-            linkhmac_hex = str(api_link["hmac"]).strip()
-        except Exception as e:
-            print(f"ERROR: api_link response missing fields: {e}", file=sys.stderr)
-            print(_pretty_json(api_link_obj))
-            return 1
+    creds = parse_api_link_response_json(obj)
+    print("api_link response decrypted OK.")
+    print(f"  linkkey length: {len(creds.linkkey_hex)} hex chars")
+    print(f"  linkhmac length: {len(creds.linkhmac_hex)} hex chars")
 
-        print(f"  linkkey length: {len(linkkey_hex)} hex chars")
-        print(f"  linkhmac length: {len(linkhmac_hex)} hex chars")
+    # 3) hello (clear/unframed) + decrypt session keys
+    print("Sending hello (clear, UNFRAMED)...")
+    keys = perform_hello(sock=sock, identity=identity, linkkey_hex=creds.linkkey_hex, seq=110, timeout_s=5.0)
+    print("hello response processed OK.")
+    print(f"  sessionKey length: {len(keys.session_key_hex)} hex chars")
+    print(f"  hmacKey length:    {len(keys.hmac_key_hex)} hex chars")
 
-        # 4) hello clear (UNFRAMED)
-        hello_req = build_hello_request_json(
-            mn=linkprep.mn,
-            sn=linkprep.sn,
-            fwver=linkprep.fwver,
-            hwver=linkprep.hwver,
-            osver=linkprep.osver,
-            json_seq=110,
-        )
-        print("Sending hello (clear, UNFRAMED)...")
-        if args.log_raw:
-            print(f">> hello JSON: {hello_req.decode('utf-8', errors='replace')}")
-        sock.sendall(hello_req)
+    # 4) authenticate + sample call(s)
+    # For step 2 we stop here (you already have working auth/call path);
+    # step 3/4 will move encrypted call into session.py and then HA integration.
+    if args.do_area_status:
+        print("NOTE: Encrypted calls remain in the original smoketest until Step 3 introduces session.py.")
 
-        # 5) hello response clear JSON; decrypt sk/shm fields with linkkey
-        hello_obj = wait_for_hello_response(sock, recv_chunk=args.recv_chunk, timeout=args.timeout, log_raw=args.log_raw)
-
-        try:
-            hello = hello_obj["hello"]
-            session_id_unauth = int(hello["session_id"])
-            sk_hex = str(hello["sk"]).strip()
-            shm_hex = str(hello["shm"]).strip()
-        except Exception as e:
-            print(f"ERROR: hello response missing fields: {e}", file=sys.stderr)
-            print(_pretty_json(hello_obj))
-            return 1
-
-        try:
-            session_key_bytes = decrypt_hello_field(linkkey_hex=linkkey_hex, field_hex=sk_hex)
-            hmac_key_bytes = decrypt_hello_field(linkkey_hex=linkkey_hex, field_hex=shm_hex)
-        except Exception as e:
-            print(f"ERROR: decrypting hello keys failed: {e}", file=sys.stderr)
-            return 1
-
-        session_key_hex = _bytes_to_hex_upper(session_key_bytes)
-        hmac_key_hex = _bytes_to_hex_upper(hmac_key_bytes)
-
-        print("hello response processed OK.")
-        print(f"  sessionKey length: {len(session_key_hex)} hex chars")
-        print(f"  hmacKey length:    {len(hmac_key_hex)} hex chars")
-
-        # 6) send encrypted authenticate (schema-0)
-        auth_cmd = {"authenticate": {"seq": 110, "pin": int(args.pin)}}
-        auth_cmd_bytes = json.dumps(auth_cmd, separators=(",", ":")).encode("utf-8")
-
-        protocol_byte, data_frame = pack_outbound_schema0(
-            json_bytes=auth_cmd_bytes,
-            session_key_hex=session_key_hex,
-            src=1,
-            dest=0,
-            seq=1234,
-            head=0,
-        )
-        wire = frame_build(protocol_byte=protocol_byte, data_frame=data_frame)
-
-        print("Sending encrypted authenticate (schema-0)...")
-        if args.log_raw:
-            print(f">> cmd JSON: {auth_cmd_bytes.decode('utf-8', errors='replace')}")
-            print(f">> protocol: 0x{protocol_byte:02X}")
-            print(f">> data_frame (ciphertext) {len(data_frame)} bytes: {_hex(data_frame)}")
-            print(f">> framed bytes: {_hex(wire)}")
-        sock.sendall(wire)
-
-        ack, auth_resp = wait_for_encrypted_response(
-            sock,
-            deframe_state=deframe_state,
-            session_key_hex=session_key_hex,
-            recv_chunk=args.recv_chunk,
-            timeout=args.timeout,
-            log_raw=args.log_raw,
-            label="authenticate",
-        )
-
-        print("=== Decrypted response JSON ===")
-        print(_pretty_json(auth_resp))
-
-        # Optional: area.get_status
-        if args.do_area_status:
-            try:
-                session_id = int(auth_resp["authenticate"]["session_id"])
-            except Exception as e:
-                print(f"ERROR: could not extract session_id from authenticate response: {e}", file=sys.stderr)
-                return 1
-
-            area_cmd = {
-                "seq": 111,
-                "session_id": session_id,
-                "area": {
-                    "get_status": {
-                        "area_id": 1
-                    }
-                },
-            }
-            area_cmd_bytes = json.dumps(area_cmd, separators=(",", ":")).encode("utf-8")
-
-            protocol_byte2, data_frame2 = pack_outbound_schema0(
-                json_bytes=area_cmd_bytes,
-                session_key_hex=session_key_hex,
-                src=1,
-                dest=0,
-                seq=1235,
-                head=0,
-            )
-            wire2 = frame_build(protocol_byte=protocol_byte2, data_frame=data_frame2)
-
-            print("Sending encrypted area.get_status (schema-0)...")
-            if args.log_raw:
-                print(f">> area cmd JSON: {area_cmd_bytes.decode('utf-8', errors='replace')}")
-                print(f">> protocol: 0x{protocol_byte2:02X}")
-                print(f">> framed bytes: {_hex(wire2)}")
-            sock.sendall(wire2)
-
-            _, area_resp = wait_for_encrypted_response(
-                sock,
-                deframe_state=deframe_state,
-                session_key_hex=session_key_hex,
-                recv_chunk=args.recv_chunk,
-                timeout=args.timeout,
-                log_raw=args.log_raw,
-                label="area.get_status",
-            )
-
-            print("=== Decrypted area.get_status response JSON ===")
-            print(_pretty_json(area_resp))
-
-        return 0
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        raise SystemExit(130)
+    raise SystemExit(main())
