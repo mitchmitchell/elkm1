@@ -25,7 +25,7 @@ from .util import calculate_crc16_checksum
 STARTCHAR: int = 0x7E
 
 
-class LinkStates(IntEnum):
+class FrameStates(IntEnum):
     WAIT_START = 1
     WAIT_LENGTH = 2
     WAIT_DATA = 3
@@ -70,7 +70,7 @@ class DeframeState:
     # one duplicate protocol byte in that specific situation.
     just_resynced: bool = False
 
-    rcv_state: LinkStates = LinkStates.WAIT_START
+    rcv_state: FrameStates = FrameStates.WAIT_START
     msglength: int = 0
 
     # Unescaped framed bytes excluding STARTCHAR:
@@ -119,7 +119,7 @@ def frame_build(*, protocol_byte: int, data_frame: bytes) -> bytes:
 
 
 def _reset_to_wait_start(state: DeframeState) -> None:
-    state.rcv_state = LinkStates.WAIT_START
+    state.rcv_state = FrameStates.WAIT_START
     state.msglength = 0
     state.input_buffer = bytearray()
     state.escaping = False
@@ -148,7 +148,7 @@ def deframe_feed(state: DeframeState, chunk: bytes) -> List[DeframeResult]:
             # STARTCHAR followed by non-zero => new frame start; b is protocol.
             state.input_buffer = bytearray([b])
             state.msglength = 0
-            state.rcv_state = LinkStates.WAIT_LENGTH
+            state.rcv_state = FrameStates.WAIT_LENGTH
             state.escaping = False
             state.just_resynced = True
             continue
@@ -159,11 +159,11 @@ def deframe_feed(state: DeframeState, chunk: bytes) -> List[DeframeResult]:
             state.escaping = False
 
         # Until we see STARTCHAR+protocol (resync rule above), ignore bytes.
-        if state.rcv_state == LinkStates.WAIT_START:
+        if state.rcv_state == FrameStates.WAIT_START:
             continue
 
         # Collect 2 length bytes after protocol
-        if state.rcv_state == LinkStates.WAIT_LENGTH:
+        if state.rcv_state == FrameStates.WAIT_LENGTH:
             # If we just started a frame via resync, and the very next byte repeats the
             # protocol byte, ignore that one duplicate byte (test harness splices like this).
             if state.just_resynced and len(state.input_buffer) == 1 and b == state.input_buffer[0]:
@@ -186,11 +186,11 @@ def deframe_feed(state: DeframeState, chunk: bytes) -> List[DeframeResult]:
                     results.append(DeframeResult(ok=False, frame_no_crc=None, error=RxErrorType.OVERFLOW))
                     _reset_to_wait_start(state)
                 else:
-                    state.rcv_state = LinkStates.WAIT_DATA
+                    state.rcv_state = FrameStates.WAIT_DATA
             continue
 
         # Collect remaining bytes until full message (including CRC) is present
-        if state.rcv_state == LinkStates.WAIT_DATA:
+        if state.rcv_state == FrameStates.WAIT_DATA:
             state.input_buffer.append(b)
 
             if len(state.input_buffer) == state.msglength:
