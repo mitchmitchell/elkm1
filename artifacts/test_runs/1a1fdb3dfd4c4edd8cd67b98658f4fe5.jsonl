@@ -1,2 +1,0 @@
-{"run_id": "1a1fdb3dfd4c4edd8cd67b98658f4fe5", "test_id": "test/test_e27_area_get_status_live.py::test_live_area_get_status", "record_type": "test_start", "t_ms": 0, "ts_utc": "2025-12-27T06:41:08Z", "meta": {"pid": 83939}}
-{"run_id": "1a1fdb3dfd4c4edd8cd67b98658f4fe5", "test_id": "test/test_e27_area_get_status_live.py::test_live_area_get_status", "record_type": "test_end", "t_ms": 127, "ts_utc": "2025-12-27T06:41:08Z", "outcome": "pass", "error": null}
