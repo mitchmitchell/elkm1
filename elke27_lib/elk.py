@@ -517,6 +517,7 @@ class Elk:
             route=ctx.route,
             session_id=ctx.session_id if ctx.session_id is not None else self.state.panel.session_id,
         )
+        self._log.debug("Emit event: %s", stamped)
         self._events.append(stamped)
 
     def drain_events(self) -> list[Event]:

@@ -41,6 +41,7 @@ class SessionConfig:
     hello_timeout_s: float = 5.0       # overall HELLO timeout
     recv_max_bytes: int = 4096         # per socket recv() call
     protocol_default: int = 0x80       # default protocol byte for schema-0 encrypted frames
+    wire_log: bool = False            # enable raw RX/TX hex dump logging
 
 
 @dataclass(frozen=True)
@@ -270,16 +271,18 @@ class Session:
                 # keep pumping until overall deadline
                 continue
 
-            logger.debug("RX raw chunk (%d bytes): %s", len(chunk), chunk.hex())
+            if self.cfg.wire_log and logger.isEnabledFor(logging.DEBUG):
+                logger.debug("RX raw chunk (%d bytes): %s", len(chunk), chunk.hex())
 
             results = deframe_feed(self._deframe_state, chunk)
             for r in results:
                 if getattr(r, "ok", False):
-                    logger.debug(
-                        "RX frame_no_crc (%d bytes): %s",
-                        len(r.frame_no_crc or b""),
-                        (r.frame_no_crc or b"").hex(),
-                    )
+                    if self.cfg.wire_log and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "RX frame_no_crc (%d bytes): %s",
+                            len(r.frame_no_crc or b""),
+                            (r.frame_no_crc or b"").hex(),
+                        )
                     return r.frame_no_crc
                 # CRC-bad or malformed frames: ignore and keep scanning.
                 # If the framing layer provides details, emit at debug level.
@@ -306,10 +309,12 @@ class Session:
             src=1,
             dest=0,
             head=0,
-            envelope_seq=0,
+            envelope_seq=1234,
         )
 
         framed = frame_build(protocol_byte=proto, data_frame=ciphertext)
+        if self.cfg.wire_log and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("TX framed (%d bytes): %s", len(framed), framed.hex())
         self._send_all(framed)
 
     def recv_json(self, *, timeout_s: float = 5.0) -> dict[str, Any]:

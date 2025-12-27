@@ -147,7 +147,7 @@ def make_ctrl_get_version_info_handler(state: PanelState, emit: EmitFn, now: Now
                     session_id=UNSET_SESSION_ID,
                     changed_fields=outcome.changed_fields,
                 ),
-                ctx,
+                ctx=ctx,
             )
 
         if outcome.error_code is not None and outcome.error_code != 0:
@@ -164,7 +164,7 @@ def make_ctrl_get_version_info_handler(state: PanelState, emit: EmitFn, now: Now
                     entity_id=None,
                     message=None,
                 ),
-                ctx,
+                ctx=ctx,
             )
 
         if outcome.warnings:
@@ -181,7 +181,7 @@ def make_ctrl_get_version_info_handler(state: PanelState, emit: EmitFn, now: Now
                     keys=outcome.warnings,
                     severity="info",
                 ),
-                ctx,
+                ctx=ctx,
             )
 
         return True

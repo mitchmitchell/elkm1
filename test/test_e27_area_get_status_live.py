@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -35,6 +36,10 @@ class _Credentials:
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_live_area_get_status() -> None:
+    log_level = str(_env("LOG_LEVEL", "INFO") or "INFO").upper()
+    logging.basicConfig(level=getattr(logging, log_level, logging.INFO), force=True)
+    logging.getLogger("elke27_lib.session").setLevel(logging.DEBUG)
+
     host = _require_env("ELKE27_HOST")
     port = int(_env("ELKE27_PORT", "2101") or 2101)
     access_code = _require_env("ELKE27_ACCESS_CODE")

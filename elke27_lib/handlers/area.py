@@ -19,6 +19,7 @@ Policy:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Callable, Mapping, Optional, Set, Tuple, Union
 
 from elke27_lib.events import (
@@ -38,6 +39,8 @@ from elke27_lib.dispatcher import DispatchContext  # adjust import to your dispa
 
 EmitFn = Callable[[object, DispatchContext], None]
 NowFn = Callable[[], float]
+
+LOG = logging.getLogger(__name__)
 
 
 # -------------------------
@@ -200,11 +203,13 @@ def make_area_get_status_handler(state: PanelState, emit: EmitFn, now: NowFn):
                     entity_id=area_id if isinstance(area_id, int) else None,
                     message=None,
                 ),
-                ctx,
+                ctx=ctx,
             )
             return True
 
         outcome = _reconcile_area_state(state, payload, now=now(), source="snapshot")
+        if state.debug_last_raw_by_route_enabled:
+            state.debug_last_raw_by_route["area.get_status"] = dict(payload)
 
         if outcome.area_id < 1:
             emit(
@@ -220,24 +225,27 @@ def make_area_get_status_handler(state: PanelState, emit: EmitFn, now: NowFn):
                     keys=tuple(payload.keys()),
                     severity="warning",
                 ),
-                ctx,
+                ctx=ctx,
             )
             return False
 
         if outcome.changed_fields:
-            emit(
-                AreaStatusUpdated(
-                    kind=AreaStatusUpdated.KIND,
-                    at=UNSET_AT,
-                    seq=UNSET_SEQ,
-                    classification=UNSET_CLASSIFICATION,
-                    route=UNSET_ROUTE,
-                    session_id=UNSET_SESSION_ID,
-                    area_id=outcome.area_id,
-                    changed_fields=outcome.changed_fields,
-                ),
-                ctx,
+            LOG.debug("area.get_status changed_fields=%s area_id=%s", outcome.changed_fields, outcome.area_id)
+            evt = AreaStatusUpdated(
+                kind=AreaStatusUpdated.KIND,
+                at=UNSET_AT,
+                seq=UNSET_SEQ,
+                classification=UNSET_CLASSIFICATION,
+                route=UNSET_ROUTE,
+                session_id=UNSET_SESSION_ID,
+                area_id=outcome.area_id,
+                changed_fields=outcome.changed_fields,
             )
+            try:
+                emit(evt, ctx=ctx)
+                LOG.debug("area.get_status emitted AreaStatusUpdated")
+            except Exception as e:
+                LOG.error("area.get_status emit failed: %s", e, exc_info=True)
 
         if outcome.warnings:
             emit(
@@ -253,7 +261,7 @@ def make_area_get_status_handler(state: PanelState, emit: EmitFn, now: NowFn):
                     keys=outcome.warnings,
                     severity="info",
                 ),
-                ctx,
+                ctx=ctx,
             )
 
         return True
@@ -292,7 +300,7 @@ def make_area_set_status_handler(state: PanelState, emit: EmitFn, now: NowFn):
                     keys=tuple(payload.keys()),
                     severity="warning",
                 ),
-                ctx,
+                ctx=ctx,
             )
             return False
 
@@ -308,7 +316,7 @@ def make_area_set_status_handler(state: PanelState, emit: EmitFn, now: NowFn):
                     area_id=outcome.area_id,
                     changed_fields=outcome.changed_fields,
                 ),
-                ctx,
+                ctx=ctx,
             )
 
         if outcome.error_code is not None and outcome.error_code != 0:
@@ -325,7 +333,7 @@ def make_area_set_status_handler(state: PanelState, emit: EmitFn, now: NowFn):
                     entity_id=outcome.area_id,
                     message=None,
                 ),
-                ctx,
+                ctx=ctx,
             )
 
         if outcome.warnings:
@@ -342,7 +350,7 @@ def make_area_set_status_handler(state: PanelState, emit: EmitFn, now: NowFn):
                     keys=outcome.warnings,
                     severity="info",
                 ),
-                ctx,
+                ctx=ctx,
             )
 
         return True
@@ -374,7 +382,7 @@ def make_area_domain_fallback_handler(state: PanelState, emit: EmitFn, now: NowF
                 unhandled_route=("area", "__root__"),
                 keys=tuple(area_obj.keys()),
             ),
-            ctx,
+            ctx=ctx,
         )
         return True
 

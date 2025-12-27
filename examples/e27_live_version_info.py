@@ -54,12 +54,24 @@ def _env_any(names: list[str], default: Optional[str] = None) -> Optional[str]:
     return default
 
 
+def _truthy(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 async def main_async() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--timeout", type=float, default=10.0, help="Overall timeout for request/response")
     ap.add_argument("--pump-s", type=float, default=0.25, help="Per-pump timeout")
     ap.add_argument("--address", type=str, default=None, help="Optional discovery broadcast address override")
     ap.add_argument("--log-level", default=_env_any(["LOG_LEVEL"], "INFO"), help="DEBUG/INFO/WARNING/ERROR")
+    ap.add_argument(
+        "--wire-log",
+        action="store_true",
+        default=_truthy(_env_any(["ELKE27_WIRE_LOG", "ELK_WIRE_LOG"], None)),
+        help="Enable raw RX/TX hex dump logging",
+    )
     ap.add_argument("--pin", type=int, default=None, help="Optional pin for authenticate diagnostic")
     ap.add_argument("--auth-only", action="store_true", help="Exit after authenticate diagnostic reply")
     ap.add_argument(
@@ -132,7 +144,23 @@ async def main_async() -> int:
     creds = E27Credentials(access_code=str(args.access_code), passphrase=str(args.passphrase))
 
     link_keys = await elk.link(panel, identity, creds, timeout_s=float(args.timeout))
-    state = await elk.connect(link_keys)
+
+    if isinstance(panel, dict):
+        panel_host = panel.get("host") or panel.get("ip_address")
+        panel_port = int(panel.get("port") or 2101)
+    else:
+        panel_host = panel.ip_address
+        panel_port = int(panel.port)
+
+    from elke27_lib.session import SessionConfig
+
+    session_cfg = SessionConfig(
+        host=panel_host,
+        port=panel_port,
+        hello_timeout_s=float(args.timeout),
+        wire_log=bool(args.wire_log),
+    )
+    state = await elk.connect(link_keys, session_config=session_cfg)
     print(f"Session state: {state}")
     if state is not SessionState.ACTIVE:
         raise SystemExit(f"ERROR: session not ACTIVE (state={state})")
