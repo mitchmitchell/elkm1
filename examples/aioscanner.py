@@ -1,15 +1,41 @@
+#!/usr/bin/env python3
+"""
+Example: discover E27 panels on the network using the Elk facade.
+
+No linking. No session connect.
+"""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
 import logging
 import pprint
 
-from elkm1_lib.discovery import AIOELKDiscovery
-
-logging.basicConfig(level=logging.DEBUG)
+from elke27_lib import Elk
 
 
-async def go():
-    scanner = AIOELKDiscovery()
-    pprint.pprint(await scanner.async_scan())
+async def main_async() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--timeout", type=int, default=10, help="Discovery scan timeout in seconds")
+    ap.add_argument("--address", type=str, default=None, help="Optional broadcast address override")
+    args = ap.parse_args()
+
+    result = await Elk.discover(timeout=args.timeout, address=args.address)
+
+    print("\nDiscovered panels:")
+    if not result.panels:
+        print("  (none)")
+        return 0
+
+    pprint.pprint(result.panels)
+    return 0
 
 
-asyncio.run(go())
+def main() -> int:
+    logging.basicConfig(level=logging.INFO)
+    return asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

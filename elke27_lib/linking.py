@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import socket
 import time
@@ -9,6 +10,10 @@ from dataclasses import dataclass
 from typing import Final, Optional
 
 from .errors import E27ErrorContext, E27ProvisioningTimeout, E27ProtocolError, E27TransportError
+from .framing import DeframeState, deframe_feed
+from .presentation import decrypt_api_link_response
+
+LOG = logging.getLogger(__name__)
 
 # Fixed IV for api_link and hello flows
 API_LINK_IV: Final[bytes] = bytes(range(16))  # 00 01 02 ... 0f (Java initVectorBytes)
@@ -153,10 +158,11 @@ def wait_for_discovery_nonce(sock: socket.socket, timeout_s: float = 10.0) -> st
         if "ELKWC2017" not in s:
             continue
 
-        objs = recv_cleartext_json_objects_from_bytes(bytes(buf))
-        for obj in objs:
-            if "nonce" in obj:
-                return str(obj["nonce"])
+        nonce, local = parse_discovery_hello_and_local(bytes(buf))
+        if local is not None:
+            LOG.debug("Discovery LOCAL timestamp: %s", local)
+        if nonce is not None:
+            return nonce
         # keep waiting if ELKWC2017 present but nonce not yet parsed
 
     raise E27ProvisioningTimeout(
@@ -173,6 +179,21 @@ def recv_cleartext_json_objects_from_bytes(data: bytes) -> list[dict]:
             continue
         objs.append(json.loads(part))
     return objs
+
+
+def parse_discovery_hello_and_local(data: bytes) -> tuple[str | None, str | None]:
+    """
+    Parse concatenated discovery JSON and extract nonce + LOCAL timestamp if present.
+    """
+    nonce: str | None = None
+    local: str | None = None
+    objs = recv_cleartext_json_objects_from_bytes(data)
+    for obj in objs:
+        if "nonce" in obj:
+            nonce = str(obj["nonce"])
+        if "LOCAL" in obj:
+            local = str(obj["LOCAL"])
+    return nonce, local
 
 
 def derive_pass_and_tempkey(
@@ -261,6 +282,7 @@ def perform_api_link(
     mn_for_hash: str,
     discovery_nonce: str,
     seq: int = 110,
+    timeout_s: float = 5.0,
 ) -> tuple[str, str, str]:
     """
     Provisioning exchange:
@@ -284,10 +306,123 @@ def perform_api_link(
     req = build_api_link_request(seq=seq, identity=identity, pass_hex8=pass8, cnonce_hex=cnonce)
     send_unframed_json(sock, req)
 
-    # Response is framed+encrypted schema-0. We do not implement framing/crypto here;
-    # the caller should pass the frame bytes into presentation/framing modules.
-    return tempkey, "", ""
+    # Response is framed+encrypted schema-0 (ciphertext lives in the frame data payload).
+    # We implement the minimal receive path here so the provisioning tool can return
+    # link credentials directly.
+    #
+    # Observed decrypted plaintext format:
+    #   [ack_byte][JSON bytes...]
+    #
+    # The JSON object contains:
+    #   {"api_link": {"enc": "<linkkey_hex>", "hmac": "<linkhmac_hex>", "error_code": 0}}
 
+    deadline = time.monotonic() + float(timeout_s)
+    state = DeframeState()
+    frame_no_crc: Optional[bytes] = None
+
+    while time.monotonic() < deadline:
+        # Ensure socket timeout does not exceed remaining time
+        remaining = max(0.0, deadline - time.monotonic())
+        sock.settimeout(min(1.0, remaining))
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            continue
+        except OSError as e:
+            raise E27TransportError(
+                f"Socket error receiving api_link response: {e}",
+                context=E27ErrorContext(phase="api_link_recv"),
+                cause=e,
+            )
+
+        if not chunk:
+            raise E27TransportError(
+                "Socket closed while waiting for api_link response.",
+                context=E27ErrorContext(phase="api_link_recv"),
+            )
+
+        for res in deframe_feed(state, chunk):
+            if res.ok and res.frame_no_crc:
+                frame_no_crc = res.frame_no_crc
+                break
+        if frame_no_crc is not None:
+            break
+
+    if frame_no_crc is None:
+        raise E27ProvisioningTimeout(
+            "Timed out waiting for framed api_link response.",
+            context=E27ErrorContext(phase="api_link_recv", detail=f"timeout_s={timeout_s}"),
+        )
+
+    # frame_no_crc = protocol(1) + length_le(2) + data_frame(...)
+    if len(frame_no_crc) < 3:
+        raise E27ProtocolError(
+            "Framed api_link response too short (missing header).",
+            context=E27ErrorContext(phase="api_link_recv", detail=f"frame_no_crc_len={len(frame_no_crc)}"),
+        )
+
+    ciphertext = frame_no_crc[3:]
+    if not ciphertext:
+        raise E27ProtocolError(
+            "Framed api_link response contained empty ciphertext payload.",
+            context=E27ErrorContext(phase="api_link_recv"),
+        )
+
+    ack, json_bytes = decrypt_api_link_response(
+        protocol_byte=frame_no_crc[0],
+        ciphertext=ciphertext,
+        tempkey_hex=tempkey,
+        iv=API_LINK_IV,
+    )
+    LOG.debug("api_link frame_no_crc hex=%s", frame_no_crc.hex())
+    LOG.debug("api_link ciphertext hex=%s", ciphertext.hex())
+    LOG.debug(
+        "api_link decrypted ack=0x%02x bytes_len=%d hex=%s",
+        ack,
+        len(json_bytes),
+        json_bytes.hex(),
+    )
+
+    # Most captures show 0x00 ACK; log and continue if a different ACK is used.
+    if ack != 0x00:
+        LOG.warning(
+            "api_link nonzero ACK 0x%02x; continuing decode; decrypted=%s",
+            ack,
+            json_bytes.decode("utf-8", errors="replace"),
+        )
+
+    # Panel may concatenate JSON objects back-to-back; parse the first one with api_link.
+    try:
+        text = json_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as e:
+        LOG.warning("api_link decrypted bytes not UTF-8; hex=%s", json_bytes.hex())
+        raise E27ProtocolError(
+            "api_link decrypt produced non-UTF-8 payload.",
+            context=E27ErrorContext(phase="api_link_parse"),
+            cause=e,
+        )
+    objs = _parse_concatenated_json_objects(text)
+    if not objs:
+        raise E27ProtocolError(
+            "api_link decrypt produced no JSON objects.",
+            context=E27ErrorContext(phase="api_link_parse"),
+        )
+
+    parsed = None
+    for s in objs:
+        o = json.loads(s)
+        if isinstance(o, dict) and "api_link" in o:
+            parsed = o
+            break
+
+    if parsed is None:
+        raise E27ProtocolError(
+            "api_link decrypt JSON did not contain an 'api_link' object.",
+            context=E27ErrorContext(phase="api_link_parse"),
+        )
+
+    creds = parse_api_link_response_json(parsed)
+    return tempkey, creds.linkkey_hex, creds.linkhmac_hex
 
 def parse_api_link_response_json(obj: dict) -> LinkCredentials:
     """

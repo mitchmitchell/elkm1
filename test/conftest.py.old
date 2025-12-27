@@ -1,0 +1,117 @@
+# test/conftest.py
+from __future__ import annotations
+
+import os
+import pathlib
+import uuid
+from typing import Generator, Optional
+
+import pytest
+from test.helpers.reporter import Reporter
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("e27")
+    group.addoption(
+        "--e27-live",
+        action="store_true",
+        default=False,
+        help="Enable tests marked as live (requires real panel + credentials).",
+    )
+    group.addoption(
+        "--e27-report",
+        action="store",
+        default=os.getenv("ELK_E27_REPORT_FORMAT", "jsonl"),
+        choices=("jsonl", "yaml", "both", "none"),
+        help="Test artifact format: jsonl (default), yaml, both, or none. "
+             "YAML is derived from JSON records.",
+    )
+    group.addoption(
+        "--e27-artifacts-dir",
+        action="store",
+        default=os.getenv("ELK_E27_ARTIFACTS_DIR", "artifacts/test_runs"),
+        help="Directory to write E27 test artifacts (default: artifacts/test_runs).",
+    )
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
+    # Attach the report to the item so fixtures can access pass/fail and exceptions.
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, f"rep_{rep.when}", rep)
+
+@pytest.fixture
+def notifier():
+    from elkm1_lib.notify import Notifier
+    return Notifier()
+
+@pytest.fixture(scope="session")
+def e27_run_id() -> str:
+    # Stable per pytest invocation.
+    return uuid.uuid4().hex
+
+@pytest.fixture()
+def reporter(request: pytest.FixtureRequest, e27_run_id: str) -> Generator[Reporter, None, None]:
+    cfg = request.config
+    report_mode = str(cfg.getoption("--e27-report")).lower()
+    artifacts_dir = pathlib.Path(str(cfg.getoption("--e27-artifacts-dir")))
+    emit_jsonl = report_mode in ("jsonl", "both")
+    emit_yaml = report_mode in ("yaml", "both")
+    enable = report_mode != "none"
+
+    r = Reporter(
+        run_id=e27_run_id,
+        test_id=request.node.nodeid,
+        artifacts_dir=artifacts_dir,
+        emit_jsonl=emit_jsonl,
+        emit_yaml=emit_yaml,
+        enable=enable,
+    )
+    r.test_start()
+
+    try:
+        yield r
+    finally:
+        rep_setup = getattr(request.node, "rep_setup", None)
+        rep_call = getattr(request.node, "rep_call", None)
+        rep_teardown = getattr(request.node, "rep_teardown", None)
+
+        outcome = "unknown"
+        longrepr = None
+        when = None
+
+        # Setup failures always win
+        if rep_setup is not None and rep_setup.failed:
+            outcome = "fail"
+            longrepr = rep_setup.longrepr
+            when = "setup"
+
+        # Call phase (normal test execution)
+        elif rep_call is not None:
+            when = "call"
+            if rep_call.passed:
+                outcome = "pass"
+            elif rep_call.skipped:
+                outcome = "skip"
+                longrepr = rep_call.longrepr
+            else:
+                outcome = "fail"
+                longrepr = rep_call.longrepr
+
+        # Teardown failures (only if setup/call did not already fail)
+        if outcome == "pass" and rep_teardown is not None and rep_teardown.failed:
+            outcome = "fail"
+            longrepr = rep_teardown.longrepr
+            when = "teardown"
+
+        r.test_end(outcome=outcome, when=when, longrepr=longrepr)
+        r.finalize()
+        outcome = "unknown"
+
+@pytest.fixture()
+def fail_setup():
+    assert False, "intentional setup failure"
+
+@pytest.fixture()
+def fail_teardown():
+    yield
+    assert False, "intentional teardown failure"

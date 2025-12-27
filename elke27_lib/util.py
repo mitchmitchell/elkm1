@@ -97,7 +97,8 @@ def calculate_crc16_checksum(w_sum: int, data_bytes: bytes | bytearray, start: i
 
 from typing import Union
 
-def swap_endianness(src: Union[bytes, bytearray, list[int]]) -> bytearray:
+#def swap_endianness(src: Union[bytes, bytearray, list[int]]) -> bytearray:
+def swap_endianness(src: Union[bytes, bytearray, list[int]]) -> bytes:
     """
     Swaps the endianness of 32-bit words in a byte array.
     Processes the input in 4-byte chunks, reversing the order of bytes within each chunk.
@@ -131,7 +132,7 @@ def swap_endianness(src: Union[bytes, bytearray, list[int]]) -> bytearray:
         result[index + 2] = data[index + 1]
         result[index + 3] = data[index + 0]
 
-    return result
+    return bytes(result)
 
 def calculate_block_padding(length: int, block_size: int = 16) -> int:
     """

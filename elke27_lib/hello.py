@@ -19,14 +19,28 @@ Related DDRs:
 from __future__ import annotations
 
 import json
+import logging
+import time
 import socket
 from dataclasses import dataclass
 from typing import Optional
 
-from .errors import E27ErrorContext, E27ProtocolError, E27TransportError, E27Timeout
-from .linking import E27Identity, recv_cleartext_json_objects, send_unframed_json
+from .errors import (
+    E27ErrorContext,
+    E27ProtocolError,
+    E27ProvisioningTimeout,
+    E27TransportError,
+    E27Timeout,
+)
+from .linking import (
+    E27Identity,
+    recv_cleartext_json_objects,
+    recv_cleartext_json_objects_from_bytes,
+    send_unframed_json,
+)
 from .presentation import decrypt_key_field_with_linkkey
 
+LOG = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class SessionKeys:
@@ -83,21 +97,55 @@ def perform_hello(
     """
     req = build_hello_request(seq=seq, identity=identity)
 
+    # Check for any pre-hello bytes already queued by the panel.
+    pre_objs: list[dict] = []
+    try:
+        sock.settimeout(0.05)
+        predata = sock.recv(4096)
+        if predata:
+            LOG.warning("Pre-HELLO bytes received: %s", predata.hex())
+            try:
+                pre_objs = recv_cleartext_json_objects_from_bytes(predata)
+            except Exception as e:
+                LOG.warning("Pre-HELLO JSON parse failed: %s", e)
+    except (socket.timeout, BlockingIOError):
+        pass
+
     # Send clear, UNFRAMED JSON
     send_unframed_json(sock, req)
 
-    # Receive clear, UNFRAMED JSON (may be concatenated objects)
-    try:
-        objs = recv_cleartext_json_objects(sock, timeout_s=timeout_s)
-    except E27Timeout:
-        raise
-    except E27TransportError:
-        raise
-    except Exception as e:
+    # Receive clear, UNFRAMED JSON (may be concatenated objects). Some panels emit
+    # discovery/LOCAL objects before hello; keep reading until hello or timeout.
+    deadline = time.monotonic() + float(timeout_s)
+    objs: list[dict] = []
+    if pre_objs:
+        objs.extend(pre_objs)
+
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            batch = recv_cleartext_json_objects(sock, timeout_s=remaining)
+        except (E27Timeout, E27ProvisioningTimeout):
+            continue
+        except E27TransportError:
+            raise
+        except Exception as e:
+            raise E27ProtocolError(
+                f"Unexpected error receiving hello response: {e}",
+                context=E27ErrorContext(phase="hello_recv"),
+                cause=e,
+            )
+
+        objs.extend(batch)
+        if any(isinstance(o, dict) and "hello" in o for o in objs):
+            break
+
+    if not any(isinstance(o, dict) and "hello" in o for o in objs):
+        raw_preview = json.dumps(objs, separators=(",", ":"), ensure_ascii=True)
+        LOG.warning("HELLO response missing 'hello': %s", raw_preview)
         raise E27ProtocolError(
-            f"Unexpected error receiving hello response: {e}",
-            context=E27ErrorContext(phase="hello_recv"),
-            cause=e,
+            "Hello response not found in cleartext JSON stream.",
+            context=E27ErrorContext(phase="hello_recv", detail=f"objs={raw_preview}"),
         )
 
     hello_obj = _select_hello_object(objs)

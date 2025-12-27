@@ -21,11 +21,13 @@ import logging
 import socket
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Optional
 
 from .framing import DeframeState, deframe_feed, frame_build
 from .hello import perform_hello
 from .presentation import decrypt_schema0_envelope, encrypt_schema0_envelope
+from . import linking
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +50,40 @@ class SessionInfo:
     session_hmac_hex: str
 
 
+class SessionState(str, Enum):
+    """Internal connection lifecycle states.
+
+    This is intentionally mechanical and policy-free.
+    """
+
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    HELLO = "hello"
+    ACTIVE = "active"
+
+
+class SessionError(RuntimeError):
+    """Base exception for Session failures."""
+
+
+class SessionNotReadyError(SessionError):
+    """Raised when an operation requires an ACTIVE session."""
+
+
+class SessionIOError(SessionError):
+    """Raised when the underlying transport fails."""
+
+
+class SessionProtocolError(SessionError):
+    """Raised when framing/crypto/JSON decoding fails."""
+
+
 class Session:
     """
     Minimal E27 session connection.
 
     Typical usage:
-        s = Session(cfg, identity="elk-client", link_key_hex="...")
+        s = Session(cfg, identity=identity, link_key_hex="...")
         s.connect()          # performs HELLO and becomes ready
         s.send_json({...})   # application sends requests (including authenticate if desired)
         obj = s.recv_json()  # or call s.pump_once() to dispatch via callback
@@ -63,7 +93,7 @@ class Session:
         self,
         cfg: SessionConfig,
         *,
-        identity: str,
+        identity: linking.E27Identity,
         link_key_hex: str,
     ) -> None:
         self.cfg = cfg
@@ -74,6 +104,9 @@ class Session:
         self._deframe_state: Optional[DeframeState] = None
 
         self.info: Optional[SessionInfo] = None
+
+        self.state: SessionState = SessionState.DISCONNECTED
+        self.last_error: Exception | None = None
 
         # Event hooks (optional)
         self.on_connected: Optional[Callable[[SessionInfo], None]] = None
@@ -88,30 +121,56 @@ class Session:
         """
         Connect TCP and perform HELLO to obtain session keys.
         """
-        self.close()
+        if self.state is not SessionState.DISCONNECTED:
+            # Mechanical safety: connect() is intended to establish a new session.
+            self.close()
+
+        self.last_error = None
+        self.state = SessionState.CONNECTING
 
         logger.info("E27 Session connecting to %s:%s", self.cfg.host, self.cfg.port)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(self.cfg.connect_timeout_s)
-        s.connect((self.cfg.host, self.cfg.port))
+        try:
+            s.settimeout(self.cfg.connect_timeout_s)
+            s.connect((self.cfg.host, self.cfg.port))
+        except OSError as e:
+            self.last_error = e
+            self.state = SessionState.DISCONNECTED
+            try:
+                s.close()
+            except Exception:
+                pass
+            raise SessionIOError(
+                f"Failed to connect to {self.cfg.host}:{self.cfg.port}: {e}"
+            ) from e
 
         # After connect, switch to pump cadence timeout.
         s.settimeout(self.cfg.io_timeout_s)
-
         self.sock = s
         self._deframe_state = DeframeState()
 
-        keys = perform_hello(
-            sock=s,
-            identity=self.identity,
-            link_key_hex=self.link_key_hex,
-            timeout_s=self.cfg.hello_timeout_s,
-        )
+        self.state = SessionState.HELLO
+        try:
+            keys = perform_hello(
+                sock=s,
+                identity=self.identity,
+                linkkey_hex=self.link_key_hex,
+                timeout_s=self.cfg.hello_timeout_s,
+            )
+        except Exception as e:
+            self.last_error = e
+            # HELLO failure is a session setup failure; close and surface clearly.
+            self._handle_disconnect(e)
+            raise SessionProtocolError(
+                f"HELLO failed for {self.cfg.host}:{self.cfg.port}: {e}"
+            ) from e
+
         self.info = SessionInfo(
             session_id=keys.session_id,
             session_key_hex=keys.session_key_hex,
-            session_hmac_hex=keys.session_hmac_hex,
+            session_hmac_hex=keys.hmac_key_hex,
         )
+        self.state = SessionState.ACTIVE
 
         logger.info("E27 HELLO complete; session_id=%s", self.info.session_id)
 
@@ -132,14 +191,22 @@ class Session:
         self.sock = None
         self._deframe_state = None
         self.info = None
+        self.state = SessionState.DISCONNECTED
 
     # --------------------------
     # Transport helpers
     # --------------------------
 
     def _require_ready(self) -> None:
-        if self.sock is None or self.info is None or self._deframe_state is None:
-            raise RuntimeError("Session is not connected/ready (call connect() first).")
+        if (
+            self.state is not SessionState.ACTIVE
+            or self.sock is None
+            or self.info is None
+            or self._deframe_state is None
+        ):
+            raise SessionNotReadyError(
+                "Session is not ACTIVE/ready (call connect() successfully first)."
+            )
 
     def _recv_some(self, *, max_bytes: int) -> bytes:
         """
@@ -152,17 +219,28 @@ class Session:
         try:
             data = self.sock.recv(max_bytes)
         except socket.timeout as e:
-            raise TimeoutError("socket timeout") from e
+            raise TimeoutError("Timed out waiting for data from the panel.") from e
+        except OSError as e:
+            raise SessionIOError(
+                f"Socket read failed from {self.cfg.host}:{self.cfg.port}: {e}"
+            ) from e
 
         if not data:
-            raise ConnectionError("socket closed")
+            raise SessionIOError(
+                f"Connection closed by the panel ({self.cfg.host}:{self.cfg.port})."
+            )
 
         return data
 
     def _send_all(self, data: bytes) -> None:
         self._require_ready()
         assert self.sock is not None
-        self.sock.sendall(data)
+        try:
+            self.sock.sendall(data)
+        except OSError as e:
+            raise SessionIOError(
+                f"Socket write failed to {self.cfg.host}:{self.cfg.port}: {e}"
+            ) from e
 
     # --------------------------
     # Framed receive pump
@@ -182,7 +260,9 @@ class Session:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("timed out waiting for framed message")
+                raise TimeoutError(
+                    "Timed out waiting for a framed message from the panel."
+                )
 
             try:
                 chunk = self._recv_some(max_bytes=self.cfg.recv_max_bytes)
@@ -190,12 +270,22 @@ class Session:
                 # keep pumping until overall deadline
                 continue
 
+            logger.debug("RX raw chunk (%d bytes): %s", len(chunk), chunk.hex())
+
             results = deframe_feed(self._deframe_state, chunk)
             for r in results:
                 if getattr(r, "ok", False):
+                    logger.debug(
+                        "RX frame_no_crc (%d bytes): %s",
+                        len(r.frame_no_crc or b""),
+                        (r.frame_no_crc or b"").hex(),
+                    )
                     return r.frame_no_crc
-                # CRC-bad frames are ignored by simply continuing to scan.
-                # framing module returns errors; Session policy is "ignore and keep scanning".
+                # CRC-bad or malformed frames: ignore and keep scanning.
+                # If the framing layer provides details, emit at debug level.
+                err = getattr(r, "error", None)
+                if err:
+                    logger.debug("Ignoring invalid frame while resyncing: %s", err)
 
     # --------------------------
     # Public send/recv API
@@ -211,9 +301,12 @@ class Session:
         payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
         proto, ciphertext = encrypt_schema0_envelope(
-            session_key_hex=self.info.session_key_hex,
             payload=payload,
-            protocol_base=(protocol_byte if protocol_byte is not None else self.cfg.protocol_default),
+            session_key=bytes.fromhex(self.info.session_key_hex),
+            src=1,
+            dest=0,
+            head=0,
+            envelope_seq=0,
         )
 
         framed = frame_build(protocol_byte=proto, data_frame=ciphertext)
@@ -228,24 +321,35 @@ class Session:
 
         frame_no_crc = self._recv_one_frame_no_crc(timeout_s=timeout_s)
         if len(frame_no_crc) < 3:
-            raise ValueError("frame_no_crc too short")
+            raise SessionProtocolError(
+                f"Received an invalid frame (too short) from {self.cfg.host}:{self.cfg.port}."
+            )
 
         protocol_byte = frame_no_crc[0]
         ciphertext = frame_no_crc[3:]  # skip protocol + 2-byte length
 
-        env = decrypt_schema0_envelope(
-            session_key_hex=self.info.session_key_hex,
-            protocol_byte=protocol_byte,
-            ciphertext=ciphertext,
-        )
+        try:
+            env = decrypt_schema0_envelope(
+                protocol_byte=protocol_byte,
+                ciphertext=ciphertext,
+                session_key=bytes.fromhex(self.info.session_key_hex),
+            )
+        except Exception as e:
+            raise SessionProtocolError(
+                f"Failed to decrypt schema-0 envelope from {self.cfg.host}:{self.cfg.port}: {e}"
+            ) from e
 
         try:
             obj = json.loads(env.payload.decode("utf-8"))
         except Exception as e:
-            raise ValueError(f"invalid JSON payload: {e}") from e
+            raise SessionProtocolError(
+                f"Received invalid JSON payload from {self.cfg.host}:{self.cfg.port}: {e}"
+            ) from e
 
         if not isinstance(obj, dict):
-            raise ValueError("expected JSON object (dict)")
+            raise SessionProtocolError(
+                f"Expected a JSON object (dict) but received {type(obj).__name__} from {self.cfg.host}:{self.cfg.port}."
+            )
 
         return obj
 
@@ -260,9 +364,31 @@ class Session:
             obj = self.recv_json(timeout_s=timeout_s)
         except TimeoutError:
             return None
+        except SessionNotReadyError:
+            # Caller attempted to pump without a connected session.
+            raise
+        except (SessionIOError, SessionProtocolError) as e:
+            # A transport/protocol failure means the session is no longer healthy.
+            logger.warning(
+                "Session pump failed (%s) in state=%s for %s:%s: %s",
+                type(e).__name__,
+                self.state.value,
+                self.cfg.host,
+                self.cfg.port,
+                e,
+            )
+            self._handle_disconnect(e)
+            raise
         except Exception as e:
-            # Treat as a disconnect-worthy error at Session layer.
-            logger.warning("Session pump error: %s", e)
+            # Unexpected error: still treat as disconnect-worthy at the Session layer.
+            logger.warning(
+                "Unexpected session pump error (%s) in state=%s for %s:%s: %s",
+                type(e).__name__,
+                self.state.value,
+                self.cfg.host,
+                self.cfg.port,
+                e,
+            )
             self._handle_disconnect(e)
             raise
 
@@ -272,8 +398,18 @@ class Session:
         return obj
 
     def _handle_disconnect(self, err: Exception | None) -> None:
+        self.last_error = err
         try:
             self.close()
         finally:
             if self.on_disconnected:
                 self.on_disconnected(err)
+
+    def reconnect(self) -> SessionInfo:
+        """Mechanical reconnect helper (no backoff/policy).
+
+        This is intentionally a convenience wrapper around close() + connect().
+        Any retry/backoff strategy belongs above the Session layer.
+        """
+        self.close()
+        return self.connect()

@@ -270,6 +270,7 @@ def encrypt_schema0_envelope(
 
 def decrypt_api_link_response(
     *,
+    protocol_byte: int,
     ciphertext: bytes,
     tempkey_hex: str,
     iv: bytes = API_LINK_IV,
@@ -277,16 +278,15 @@ def decrypt_api_link_response(
     """
     Decrypt the api_link response payload.
 
-    Observed plaintext format (from your live log):
-      [ack_byte][JSON bytes...]
+    Observed plaintext format (Node-RED prototype):
+      seq(4) + src(1) + dest(1) + JSON bytes... + MAGIC(2) + padding(0..15)
 
-    Unlike general schema-0 envelopes, the api_link response was handled in Node-RED
-    by stripping a leading ack byte and parsing the remaining bytes as JSON without
-    MAGIC/padding parsing.
+    The temp key must be 32-bit word swapped before AES.
+    Padding length is derived from the protocol byte low nibble.
 
     Returns: (ack_byte, json_bytes)
 
-    NOTE: This does NOT validate MAGIC or parse envelope fields.
+    NOTE: For api_link responses, we do not expose header fields; we return 0 as ack.
     """
     try:
         key = bytes.fromhex(tempkey_hex)
@@ -298,18 +298,34 @@ def decrypt_api_link_response(
         )
     _require_key_16(key, context_phase="api_link_decrypt")
 
+    key_swapped = swap_endianness(key)
     ct_swapped = swap_endianness(ciphertext)
-    pt = _aes128_cbc_decrypt(key=key, iv=iv, ciphertext=ct_swapped)
+    pt = _aes128_cbc_decrypt(key=key_swapped, iv=iv, ciphertext=ct_swapped)
     pt = swap_endianness(pt)
 
-    if len(pt) < 2:
+    if len(pt) < (4 + 1 + 1 + 2):
         raise E27ProtocolError(
             "api_link decrypt returned too few bytes.",
             context=E27ErrorContext(phase="api_link_decrypt", detail=f"pt_len={len(pt)}"),
         )
 
-    ack = pt[0]
-    json_bytes = pt[1:]
+    pad_len = protocol_padding_len(protocol_byte)
+    magic_off = len(pt) - (pad_len + 2)
+    if magic_off < 6:
+        raise E27ProtocolError(
+            "api_link decrypt too short for MAGIC/padding layout.",
+            context=E27ErrorContext(phase="api_link_decrypt", detail=f"magic_off={magic_off}"),
+        )
+
+    magic = int.from_bytes(pt[magic_off : magic_off + 2], "little", signed=False)
+    if magic != E27_MAGIC:
+        raise E27ProtocolError(
+            f"api_link MAGIC mismatch after decrypt (got 0x{magic:04x}, expected 0x{E27_MAGIC:04x}).",
+            context=E27ErrorContext(phase="api_link_decrypt", detail=f"magic=0x{magic:04x}"),
+        )
+
+    ack = pt[6]
+    json_bytes = pt[7:magic_off]
     return ack, json_bytes
 
 
@@ -318,14 +334,13 @@ def decrypt_key_field_with_linkkey(
     linkkey_hex: str,
     ciphertext_hex: str,
     iv: bytes = API_LINK_IV,
-    swap_key_32bit: bool = True,
 ) -> bytes:
     """
     Helper for hello response fields sk/shm.
 
     Node-RED proven flow:
       key_bytes = swap_endianness(hex_to_bytes(linkkey))
-      plaintext = swap_endianness( AES_DEC( swap_endianness(ciphertext) ) )
+      session_key/hmac = AES_DEC( swap_endianness(ciphertext) )
 
     Returns raw decrypted bytes (caller can hex-encode if desired).
 
@@ -343,10 +358,8 @@ def decrypt_key_field_with_linkkey(
     _require_key_16(key, context_phase="hello_key_decrypt")
     _require_len("hello_key_ciphertext", ct, 16)
 
-    if swap_key_32bit:
-        key = swap_endianness(key)
-
+    key = swap_endianness(key)
     ct_swapped = swap_endianness(ct)
+
     pt = _aes128_cbc_decrypt(key=key, iv=iv, ciphertext=ct_swapped)
-    pt = swap_endianness(pt)
     return pt

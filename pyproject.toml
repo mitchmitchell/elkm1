@@ -41,6 +41,9 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "integration: tests that require live panel/network access",
+]
 
 [tool.pylint."MESSAGES CONTROL"]
 disable = [

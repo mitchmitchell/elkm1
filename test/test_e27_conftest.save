@@ -1,0 +1,15 @@
+# test/test_e27_util.py
+
+from __future__ import annotations
+from test.helpers.trace import make_event
+
+import pytest
+from _pytest.outcomes import Failed
+
+@pytest.mark.xfail(strict=True, reason="Intentional: exercise setup-failure reporting")
+def test_force_setup_failure(reporter, fail_setup):
+    pass
+
+@pytest.mark.xfail(strict=True, raises=Failed, reason="Intentional: exercise teardown-failure reporting")
+def test_force_teardown_failure(fail_teardown):
+    pass
