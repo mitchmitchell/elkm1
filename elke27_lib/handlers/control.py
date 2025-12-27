@@ -1,7 +1,7 @@
 """
-elke27_lib/handlers/ctrl.py
+elke27_lib/handlers/control.py
 
-Read-only handlers for the "ctrl" domain.
+Read-only handlers for the "control" domain.
 
 Colocation policy:
 - Message-specific reconcile helpers live in the same module as their handlers.
@@ -15,7 +15,7 @@ Colocation policy:
     - call reconcile helper(s)
     - emit events
 
-Focus: ("ctrl","get_version_info")
+Focus: ("control","get_version_info")
 """
 
 from __future__ import annotations
@@ -52,9 +52,9 @@ class _VersionInfoOutcome:
     warnings: Tuple[str, ...]
 
 
-def _reconcile_ctrl_get_version_info(state: PanelState, payload: Mapping[str, Any], *, now: float) -> _VersionInfoOutcome:
+def _reconcile_control_get_version_info(state: PanelState, payload: Mapping[str, Any], *, now: float) -> _VersionInfoOutcome:
     """
-    Pure reconcile for ctrl.get_version_info.
+    Pure reconcile for control.get_version_info.
 
     v0 rules (conservative):
     - Patch-style only (never clears absent fields)
@@ -75,7 +75,7 @@ def _reconcile_ctrl_get_version_info(state: PanelState, payload: Mapping[str, An
 
     # Canonical stored fields (expand cautiously once live payload confirms keys)
     # Accept a couple common variants to reduce friction for first live test.
-    model = _first_present(payload, ("model", "panel_model", "ctrl_model"))
+    model = _first_present(payload, ("model", "panel_model"))
     firmware = _first_present(payload, ("firmware", "fw", "firmware_version", "sw_version", "SSP"))
     serial = _first_present(payload, ("serial", "serial_number", "sn"))
 
@@ -121,20 +121,39 @@ def _first_present(payload: Mapping[str, Any], keys: Tuple[str, ...]) -> Any:
 # Handler factory
 # -------------------------
 
-def make_ctrl_get_version_info_handler(state: PanelState, emit: EmitFn, now: NowFn):
+def make_control_get_version_info_handler(state: PanelState, emit: EmitFn, now: NowFn):
     """
     Handler for ("control","get_version_info") where payload is msg["control"]["get_version_info"].
     """
     def _handler(msg: Mapping[str, Any], ctx: DispatchContext) -> bool:
-        ctrl_obj = msg.get("control")
-        if not isinstance(ctrl_obj, Mapping):
+        control_obj = msg.get("control")
+        if not isinstance(control_obj, Mapping):
             return False
 
-        payload = ctrl_obj.get("get_version_info")
+        payload = control_obj.get("get_version_info")
         if not isinstance(payload, Mapping):
             return False
 
-        outcome = _reconcile_ctrl_get_version_info(state, payload, now=now())
+        error_code = payload.get("error_code")
+        if isinstance(error_code, int) and error_code != 0:
+            emit(
+                ApiError(
+                    kind=ApiError.KIND,
+                    at=UNSET_AT,
+                    seq=UNSET_SEQ,
+                    classification=UNSET_CLASSIFICATION,
+                    route=UNSET_ROUTE,
+                    session_id=UNSET_SESSION_ID,
+                    error_code=error_code,
+                    scope="control",
+                    entity_id=None,
+                    message=None,
+                ),
+                ctx=ctx,
+            )
+            return True
+
+        outcome = _reconcile_control_get_version_info(state, payload, now=now())
 
         if outcome.changed_fields:
             emit(
@@ -150,23 +169,6 @@ def make_ctrl_get_version_info_handler(state: PanelState, emit: EmitFn, now: Now
                 ctx=ctx,
             )
 
-        if outcome.error_code is not None and outcome.error_code != 0:
-            emit(
-                ApiError(
-                    kind=ApiError.KIND,
-                    at=UNSET_AT,
-                    seq=UNSET_SEQ,
-                    classification=UNSET_CLASSIFICATION,
-                    route=UNSET_ROUTE,
-                    session_id=UNSET_SESSION_ID,
-                    error_code=outcome.error_code,
-                    scope="ctrl",
-                    entity_id=None,
-                    message=None,
-                ),
-                ctx=ctx,
-            )
-
         if outcome.warnings:
             emit(
                 DispatchRoutingError(
@@ -177,7 +179,7 @@ def make_ctrl_get_version_info_handler(state: PanelState, emit: EmitFn, now: Now
                     route=UNSET_ROUTE,
                     session_id=UNSET_SESSION_ID,
                     code="schema_warnings",
-                    message="ctrl.get_version_info payload contained type/schema warnings.",
+                    message="control.get_version_info payload contained type/schema warnings.",
                     keys=outcome.warnings,
                     severity="info",
                 ),

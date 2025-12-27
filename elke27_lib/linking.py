@@ -30,8 +30,9 @@ class E27Identity:
 
 
 @dataclass(frozen=True, slots=True)
-class LinkCredentials:
+class E27LinkKeys:
     """Results of api_link provisioning."""
+    tempkey_hex: str   # 16 bytes -> 32 hex chars
     linkkey_hex: str   # 16 bytes -> 32 hex chars
     linkhmac_hex: str  # observed 20 bytes -> 40 hex chars (panel-specific)
 
@@ -280,24 +281,29 @@ def perform_api_link(
     access_code: str,
     passphrase: str,
     mn_for_hash: str,
-    discovery_nonce: str,
+    discovery_nonce: bytes,
     seq: int = 110,
-    timeout_s: float = 5.0,
-) -> tuple[str, str, str]:
+    timeout_s: float | None = None,
+) -> E27LinkKeys:
     """
     Provisioning exchange:
     - derive pass/tempkey from (access_code, passphrase, nonce, mn, sn, cnonce)
     - send api_link (clear/unframed)
-    Returns: (tempkey_hex, linkkey_hex, linkhmac_hex)
+    Returns: E27LinkKeys
 
     IMPORTANT: Per DDR-0020, incorrect creds may yield NO RESPONSE.
     Callers should handle E27ProvisioningTimeout and prompt user to retry.
     """
     cnonce = _random_cnonce_hex_lower(20)
+    if timeout_s is None:
+        timeout_s = 5.0
+
+    nonce_text = discovery_nonce.decode("utf-8", errors="replace")
+
     pass8, tempkey = derive_pass_tempkey_with_cnonce(
         access_code=access_code,
         passphrase=passphrase,
-        nonce=discovery_nonce,
+        nonce=nonce_text,
         cnonce=cnonce,
         mn=mn_for_hash,
         sn=identity.sn,
@@ -421,12 +427,17 @@ def perform_api_link(
             context=E27ErrorContext(phase="api_link_parse"),
         )
 
-    creds = parse_api_link_response_json(parsed)
-    return tempkey, creds.linkkey_hex, creds.linkhmac_hex
+    linkkey_hex, linkhmac_hex = parse_api_link_response_json(parsed)
+    return E27LinkKeys(
+        tempkey_hex=tempkey,
+        linkkey_hex=linkkey_hex,
+        linkhmac_hex=linkhmac_hex,
+    )
 
-def parse_api_link_response_json(obj: dict) -> LinkCredentials:
+def parse_api_link_response_json(obj: dict) -> tuple[str, str]:
     """
     Parse decrypted JSON (after ack byte stripped) for api_link response.
+    Returns (linkkey_hex, linkhmac_hex).
     """
     try:
         api_link = obj["api_link"]
@@ -448,4 +459,4 @@ def parse_api_link_response_json(obj: dict) -> LinkCredentials:
             context=E27ErrorContext(phase="api_link_parse", detail=f"error_code={err}"),
         )
 
-    return LinkCredentials(linkkey_hex=linkkey, linkhmac_hex=linkhmac)
+    return linkkey, linkhmac

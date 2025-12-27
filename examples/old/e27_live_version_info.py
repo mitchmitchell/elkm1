@@ -2,17 +2,17 @@
 """
 examples/e27_live_version_info.py
 
-E27 live test example: connect + HELLO + request ctrl.get_version_info + print results.
+E27 live test example: connect + HELLO + request control.get_version_info + print results.
 
 Assumptions / scope:
 - Linking (API_LINK) has already been done out-of-band and you have a link key.
 - This program performs NO outbound "writes" that change panel entities/states.
-  It only sends the registered request: ("ctrl","get_version_info").
+  It only sends the registered request: ("control","get_version_info").
 
 How it works:
 - Session: TCP + HELLO + framed crypto + recv pump
 - Elk: dispatcher + features + outbound request registry + event stamping/queue
-- Feature: ctrl registers handler + request builder for ("ctrl","get_version_info")
+- Feature: control registers handler + request builder for ("control","get_version_info")
 
 Environment variables (optional):
 - ELKE27_HOST
@@ -39,7 +39,7 @@ from elke27_lib.elk import Elk
 
 LOG = logging.getLogger(__name__)
 
-ROUTE_CTRL_GET_VERSION_INFO = ("ctrl", "get_version_info")
+ROUTE_CONTROL_GET_VERSION_INFO = ("control", "get_version_info")
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -48,7 +48,7 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="E27 live test: ctrl.get_version_info")
+    parser = argparse.ArgumentParser(description="E27 live test: control.get_version_info")
     parser.add_argument("--host", default=_env("ELKE27_HOST"), help="Panel IP/host (or ELKE27_HOST)")
     parser.add_argument("--port", type=int, default=int(_env("ELKE27_PORT", "2101")), help="Panel port (default 2101)")
     parser.add_argument("--identity", default=_env("ELKE27_IDENTITY", "elk-client"), help="Client identity string")
@@ -70,7 +70,7 @@ def main() -> int:
     cfg = SessionConfig(host=args.host, port=args.port)
     session = Session(cfg, identity=args.identity, link_key_hex=args.link_key_hex)
 
-    # 2) Create Elk kernel (loads DEFAULT_FEATURES: ctrl + area, etc.)
+    # 2) Create Elk kernel (loads DEFAULT_FEATURES: control + area, etc.)
     elk = Elk(session=session)
 
     # 3) Connect (HELLO runs inside Session.connect)
@@ -80,7 +80,7 @@ def main() -> int:
 
     # 4) Send request via Elk request registry
     LOG.info("Sending request: %r", ROUTE_CTRL_GET_VERSION_INFO)
-    seq = elk.request(ROUTE_CTRL_GET_VERSION_INFO)
+    seq = elk.request(ROUTE_CONTROL_GET_VERSION_INFO)
     LOG.info("Sent seq=%s", seq)
 
     # 5) Pump until we see a PanelVersionInfoUpdated or ApiError for this request,

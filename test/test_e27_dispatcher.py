@@ -79,6 +79,16 @@ def test_domain_multi_key_routes_to_root():
     assert len(r.calls) == 1
 
 
+def test_domain_root_error_routes_to_error_without_dispatch_error():
+    d = Dispatcher()
+
+    msg = {"seq": 1, "network": {"error_code": 11008, "error_message": "no authorization"}}
+    result = d.dispatch(msg)
+
+    assert result.route == ("network", "error")
+    assert not any(err.code == ERR_DOMAIN_MULTI for err in result.errors)
+
+
 def test_domain_unexpected_value_type():
     d = Dispatcher()
     r = Recorder()

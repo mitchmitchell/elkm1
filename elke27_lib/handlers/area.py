@@ -25,6 +25,8 @@ from typing import Any, Callable, Mapping, Optional, Set, Tuple, Union
 from elke27_lib.events import (
     ApiError,
     AreaStatusUpdated,
+    AreaTableInfoUpdated,
+    AreaTroublesUpdated,
     DispatchRoutingError,
     UNSET_AT,
     UNSET_CLASSIFICATION,
@@ -358,6 +360,122 @@ def make_area_set_status_handler(state: PanelState, emit: EmitFn, now: NowFn):
     return _handler
 
 
+def make_area_get_troubles_handler(state: PanelState, emit: EmitFn, now: NowFn):
+    """
+    Handler for ("area","get_troubles").
+    """
+    def _handler(msg: Mapping[str, Any], ctx: DispatchContext) -> bool:
+        area_obj = msg.get("area")
+        if not isinstance(area_obj, Mapping):
+            return False
+
+        payload = area_obj.get("get_troubles")
+        if not isinstance(payload, Mapping):
+            return False
+
+        error_code = _extract_error_code(payload)
+        if error_code is not None and error_code != 0:
+            area_id = payload.get("area_id")
+            emit(
+                ApiError(
+                    kind=ApiError.KIND,
+                    at=UNSET_AT,
+                    seq=UNSET_SEQ,
+                    classification=UNSET_CLASSIFICATION,
+                    route=UNSET_ROUTE,
+                    session_id=UNSET_SESSION_ID,
+                    error_code=error_code,
+                    scope="area",
+                    entity_id=area_id if isinstance(area_id, int) else None,
+                    message=None,
+                ),
+                ctx=ctx,
+            )
+            return True
+
+        area_id = payload.get("area_id")
+        if not isinstance(area_id, int) or area_id < 1:
+            return False
+
+        troubles = _extract_troubles_list(payload)
+        area = state.get_or_create_area(area_id)
+        area.troubles = troubles
+        area.last_update_at = now()
+        state.panel.last_message_at = area.last_update_at
+
+        emit(
+            AreaTroublesUpdated(
+                kind=AreaTroublesUpdated.KIND,
+                at=UNSET_AT,
+                seq=UNSET_SEQ,
+                classification=UNSET_CLASSIFICATION,
+                route=UNSET_ROUTE,
+                session_id=UNSET_SESSION_ID,
+                area_id=area_id,
+                troubles=tuple(troubles or []),
+            ),
+            ctx=ctx,
+        )
+        return True
+
+    return _handler
+
+
+def make_area_get_table_info_handler(state: PanelState, emit: EmitFn, now: NowFn):
+    """
+    Handler for ("area","get_table_info").
+    """
+    def _handler(msg: Mapping[str, Any], ctx: DispatchContext) -> bool:
+        area_obj = msg.get("area")
+        if not isinstance(area_obj, Mapping):
+            return False
+
+        payload = area_obj.get("get_table_info")
+        if not isinstance(payload, Mapping):
+            return False
+
+        error_code = _extract_error_code(payload)
+        if error_code is not None and error_code != 0:
+            emit(
+                ApiError(
+                    kind=ApiError.KIND,
+                    at=UNSET_AT,
+                    seq=UNSET_SEQ,
+                    classification=UNSET_CLASSIFICATION,
+                    route=UNSET_ROUTE,
+                    session_id=UNSET_SESSION_ID,
+                    error_code=error_code,
+                    scope="area",
+                    entity_id=None,
+                    message=None,
+                ),
+                ctx=ctx,
+            )
+            return True
+
+        table_info = dict(payload)
+        state.table_info_by_domain["area"] = table_info
+        state.panel.last_message_at = now()
+
+        emit(
+            AreaTableInfoUpdated(
+                kind=AreaTableInfoUpdated.KIND,
+                at=UNSET_AT,
+                seq=UNSET_SEQ,
+                classification=UNSET_CLASSIFICATION,
+                route=UNSET_ROUTE,
+                session_id=UNSET_SESSION_ID,
+                domain="area",
+                table_elements=_extract_int(payload, "table_elements"),
+                increment_size=_extract_int(payload, "increment_size"),
+            ),
+            ctx=ctx,
+        )
+        return True
+
+    return _handler
+
+
 def make_area_domain_fallback_handler(state: PanelState, emit: EmitFn, now: NowFn):
     """
     Handler for ("area","__root__") to catch multi-key/ambiguous area payloads.
@@ -387,3 +505,22 @@ def make_area_domain_fallback_handler(state: PanelState, emit: EmitFn, now: NowF
         return True
 
     return _handler
+
+
+def _extract_troubles_list(payload: Mapping[str, Any]) -> list[str]:
+    for key in ("troubles", "trouble", "items", "list"):
+        if key in payload:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [str(v) for v in value if v is not None]
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return []
+                return [text]
+    return []
+
+
+def _extract_int(payload: Mapping[str, Any], key: str) -> Optional[int]:
+    value = payload.get(key)
+    return value if isinstance(value, int) else None

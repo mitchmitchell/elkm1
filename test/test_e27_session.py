@@ -187,7 +187,7 @@ def test_send_json_encrypts_frames_and_sendall(monkeypatch: pytest.MonkeyPatch) 
         assert src == 1
         assert dest == 0
         assert head == 0
-        assert envelope_seq == 0
+        assert envelope_seq == 1234
         return 0x83, b"CIPHERTEXT"
 
     monkeypatch.setattr(session_mod, "encrypt_schema0_envelope", _fake_encrypt_schema0_envelope)

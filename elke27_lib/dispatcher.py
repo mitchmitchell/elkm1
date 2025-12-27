@@ -269,6 +269,9 @@ class Dispatcher:
         v = msg.get(domain)
 
         if isinstance(v, Mapping):
+            if self._is_domain_root_error(v):
+                return (domain, "error"), errors
+
             inner_keys = list(v.keys())
             if len(inner_keys) == 0:
                 errors.append(
@@ -306,6 +309,26 @@ class Dispatcher:
             )
         )
         return (domain, "__value__"), errors
+
+    @staticmethod
+    def _is_domain_root_error(domain_value: Mapping[str, Any]) -> bool:
+        error_code = domain_value.get("error_code")
+        if isinstance(error_code, str):
+            try:
+                error_code = int(error_code)
+            except ValueError:
+                error_code = None
+        if not isinstance(error_code, int):
+            return False
+
+        # If there's an obvious command key (non-error key whose value is a mapping), treat it as normal routing.
+        for key, value in domain_value.items():
+            if key in ("error_code", "error_message", "error_text"):
+                continue
+            if isinstance(value, Mapping):
+                return False
+
+        return True
 
     def _classify_kind(self, msg: Mapping[str, Any]) -> Tuple[Optional[int], MessageKind, List[DispatchError]]:
         errors: List[DispatchError] = []

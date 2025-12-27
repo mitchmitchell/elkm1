@@ -67,6 +67,162 @@ class AreaStatusUpdated(Event):
 
 
 # -------------------------
+# Zone events
+# -------------------------
+
+@dataclass(frozen=True, slots=True)
+class ZoneConfiguredUpdated(Event):
+    KIND = "zone_configured_updated"
+
+    configured_ids: Tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ZonesStatusBulkUpdated(Event):
+    KIND = "zones_status_bulk_updated"
+
+    updated_count: int
+    updated_ids: Tuple[int, ...]
+
+
+# -------------------------
+# Zone definitions
+# -------------------------
+
+@dataclass(frozen=True, slots=True)
+class ZoneDefsUpdated(Event):
+    KIND = "zone_defs_updated"
+
+    count: int
+    updated_ids: Tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ZoneDefFlagsUpdated(Event):
+    KIND = "zone_def_flags_updated"
+
+    count: int
+
+
+# -------------------------
+# Zone attribs
+# -------------------------
+
+@dataclass(frozen=True, slots=True)
+class ZoneAttribsUpdated(Event):
+    KIND = "zone_attribs_updated"
+
+    zone_id: int
+    changed_fields: Tuple[str, ...]
+
+
+# -------------------------
+# Area troubles
+# -------------------------
+
+@dataclass(frozen=True, slots=True)
+class AreaTroublesUpdated(Event):
+    KIND = "area_troubles_updated"
+
+    area_id: Optional[int]
+    troubles: Tuple[str, ...]
+
+
+# -------------------------
+# Output events
+# -------------------------
+
+@dataclass(frozen=True, slots=True)
+class OutputStatusUpdated(Event):
+    KIND = "output_status_updated"
+
+    output_id: int
+    status: Optional[str]
+    on: Optional[bool]
+
+
+@dataclass(frozen=True, slots=True)
+class OutputsStatusBulkUpdated(Event):
+    KIND = "outputs_status_bulk_updated"
+
+    updated_count: int
+    updated_ids: Tuple[int, ...]
+
+
+# -------------------------
+# Tstat events
+# -------------------------
+
+@dataclass(frozen=True, slots=True)
+class TstatStatusUpdated(Event):
+    KIND = "tstat_status_updated"
+
+    tstat_id: int
+    mode: Optional[str]
+    fan_mode: Optional[str]
+    temperature: Optional[int]
+
+
+# -------------------------
+# Network events
+# -------------------------
+
+@dataclass(frozen=True, slots=True)
+class NetworkSsidResultsUpdated(Event):
+    KIND = "network_ssid_results_updated"
+
+    count: int
+    ssids: Tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkRssiUpdated(Event):
+    KIND = "network_rssi_updated"
+
+    rssi: Optional[int]
+
+
+# -------------------------
+# Table info events
+# -------------------------
+
+@dataclass(frozen=True, slots=True)
+class AreaTableInfoUpdated(Event):
+    KIND = "area_table_info_updated"
+
+    domain: str
+    table_elements: Optional[int]
+    increment_size: Optional[int]
+
+
+@dataclass(frozen=True, slots=True)
+class ZoneTableInfoUpdated(Event):
+    KIND = "zone_table_info_updated"
+
+    domain: str
+    table_elements: Optional[int]
+    increment_size: Optional[int]
+
+
+@dataclass(frozen=True, slots=True)
+class OutputTableInfoUpdated(Event):
+    KIND = "output_table_info_updated"
+
+    domain: str
+    table_elements: Optional[int]
+    increment_size: Optional[int]
+
+
+@dataclass(frozen=True, slots=True)
+class TstatTableInfoUpdated(Event):
+    KIND = "tstat_table_info_updated"
+
+    domain: str
+    table_elements: Optional[int]
+    increment_size: Optional[int]
+
+
+# -------------------------
 # Trouble / diagnostics
 # -------------------------
 

@@ -100,19 +100,6 @@ class DiscoverResult:
     panels: List[discovery.ElkSystem]
 
 
-@dataclass(frozen=True, slots=True)
-class E27LinkKeys:
-    """
-    Link credentials returned by provisioning (API_LINK).
-
-    This facade type exists to give elk.py a stable return shape even if
-    linking.perform_api_link() returns a tuple internally.
-    """
-    tempkey_hex: str
-    linkkey_hex: str
-    linkhmac_hex: str
-
-
 def _panel_host_port(panel: discovery.ElkSystem | Mapping[str, Any]) -> tuple[str, int]:
     """
     Extract host/port from a discovery panel entry.
@@ -160,8 +147,12 @@ class Elk:
     """
 
     DEFAULT_FEATURES: Sequence[str] = (
-        "elke27_lib.features.ctrl",
+        "elke27_lib.features.control",
         "elke27_lib.features.area",
+        "elke27_lib.features.zone",
+        "elke27_lib.features.output",
+        "elke27_lib.features.tstat",
+        "elke27_lib.features.network_param",
     )
 
     def __init__(
@@ -244,7 +235,7 @@ class Elk:
         credentials: Any,
         *,
         timeout_s: float = 10.0,
-    ) -> E27LinkKeys:
+    ) -> linking.E27LinkKeys:
         """
         Elk.link accepts one element of the list returned by Elk.discover plus
         linking.E27Identity and linking.E27Credentials (accesscode + passphrase)
@@ -268,7 +259,7 @@ class Elk:
         if not isinstance(passphrase, str) or not passphrase:
             raise ElkError("link(): credentials.passphrase (string) is required.")
 
-        def _do_link_sync() -> E27LinkKeys:
+        def _do_link_sync() -> linking.E27LinkKeys:
             import socket
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -278,35 +269,18 @@ class Elk:
 
                 # Wait for discovery hello/nonce (cleartext)
                 nonce = linking.wait_for_discovery_nonce(sock, timeout_s=float(timeout_s))
+                nonce_bytes = nonce.encode("utf-8")
 
                 # Perform API_LINK. Existing library signature is sock-based; newer wrappers may differ.
-                try:
-                    tempkey_hex, linkkey_hex, linkhmac_hex = linking.perform_api_link(
-                        sock=sock,
-                        identity=identity,
-                        access_code=access_code,
-                        passphrase=passphrase,
-                        mn_for_hash=identity.mn,
-                        discovery_nonce=nonce,
-                        seq=110,
-                        timeout_s=float(timeout_s),  # may be accepted in updated linking.py
-                    )
-                except TypeError:
-                    # Backward signature (no timeout_s kw)
-                    tempkey_hex, linkkey_hex, linkhmac_hex = linking.perform_api_link(
-                        sock=sock,
-                        identity=identity,
-                        access_code=access_code,
-                        passphrase=passphrase,
-                        mn_for_hash=identity.mn,
-                        discovery_nonce=nonce,
-                        seq=110,
-                    )
-
-                return E27LinkKeys(
-                    tempkey_hex=str(tempkey_hex),
-                    linkkey_hex=str(linkkey_hex),
-                    linkhmac_hex=str(linkhmac_hex),
+                return linking.perform_api_link(
+                    sock=sock,
+                    identity=identity,
+                    access_code=access_code,
+                    passphrase=passphrase,
+                    mn_for_hash=identity.mn,
+                    discovery_nonce=nonce_bytes,
+                    seq=110,
+                    timeout_s=float(timeout_s),
                 )
             finally:
                 try:
@@ -327,7 +301,7 @@ class Elk:
 
     async def connect(
         self,
-        link_keys: E27LinkKeys,
+        link_keys: linking.E27LinkKeys,
         *,
         session_config: Optional[session_mod.SessionConfig] = None,
     ) -> session_mod.SessionState:
@@ -340,14 +314,9 @@ class Elk:
 
         host, port = _panel_host_port(self._panel)
 
-        if not isinstance(link_keys, E27LinkKeys):
-            # Allow duck-typed link keys (e.g., linking.E27LinkKeys in a future refactor)
-            lk = getattr(link_keys, "linkkey_hex", None) or getattr(link_keys, "link_key_hex", None)
-            if not isinstance(lk, str) or not lk:
-                raise ElkError("connect(): link_keys must provide linkkey_hex/link_key_hex (string).")
-            link_key_hex = lk
-        else:
-            link_key_hex = link_keys.linkkey_hex
+        if not isinstance(link_keys, linking.E27LinkKeys):
+            raise ElkError("connect(): link_keys must be an instance of linking.E27LinkKeys.")
+        link_key_hex = link_keys.linkkey_hex
 
         cfg = session_config or session_mod.SessionConfig(host=host, port=port)
 
