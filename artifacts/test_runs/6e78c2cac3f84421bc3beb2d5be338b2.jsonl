@@ -1,2 +1,0 @@
-{"run_id": "6e78c2cac3f84421bc3beb2d5be338b2", "test_id": "test/test_e27_framing_presentation_roundtrip.py::test_encrypt_frame_deframe_decrypt_roundtrip", "record_type": "test_start", "t_ms": 0, "ts_utc": "2025-12-26T23:46:33Z", "meta": {"pid": 64281}}
-{"run_id": "6e78c2cac3f84421bc3beb2d5be338b2", "test_id": "test/test_e27_framing_presentation_roundtrip.py::test_encrypt_frame_deframe_decrypt_roundtrip", "record_type": "test_end", "t_ms": 4, "ts_utc": "2025-12-26T23:46:33Z", "outcome": "pass", "error": null}

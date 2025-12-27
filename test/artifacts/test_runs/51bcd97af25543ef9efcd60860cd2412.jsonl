@@ -1,2 +1,0 @@
-{"run_id": "51bcd97af25543ef9efcd60860cd2412", "test_id": "test/test_e27_conftest.py::test_force_teardown_failure", "record_type": "test_start", "t_ms": 0, "ts_utc": "2025-12-25T06:09:35Z", "meta": {"pid": 11329}}
-{"run_id": "51bcd97af25543ef9efcd60860cd2412", "test_id": "test/test_e27_conftest.py::test_force_teardown_failure", "record_type": "test_end", "t_ms": 0, "ts_utc": "2025-12-25T06:09:35Z", "outcome": "fail", "error": {"when": "call", "longrepr": "[XPASS(strict)] Intentional: exercise teardown-failure reporting"}}

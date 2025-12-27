@@ -1,2 +1,0 @@
-{"run_id": "2fe7deda93454ffdb9c8f5a86c0ec1e1", "test_id": "test/test_e27_link_raw_buffers.py::test_link_raw_framed_and_deframed_buffers", "record_type": "test_start", "t_ms": 0, "ts_utc": "2025-12-27T00:52:10Z", "meta": {"pid": 69915}}
-{"run_id": "2fe7deda93454ffdb9c8f5a86c0ec1e1", "test_id": "test/test_e27_link_raw_buffers.py::test_link_raw_framed_and_deframed_buffers", "record_type": "test_end", "t_ms": 520, "ts_utc": "2025-12-27T00:52:10Z", "outcome": "pass", "error": null}
